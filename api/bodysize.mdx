@@ -75,7 +75,7 @@ When the request includes a valid `Content-Length` header, the declared byte cou
 
 ### Stream reading fallback
 
-When `Content-Length` is absent, zero, or cannot be parsed as a finite non-negative integer, `checkBodySize` clones the request and reads its body stream chunk by chunk. The running total is compared against `maxBytes` after each chunk. The stream is cancelled and HTTP 413 is returned as soon as the total exceeds the limit.
+When `Content-Length` is absent or cannot be parsed as a finite non-negative integer (i.e. `null`, non-numeric, `NaN`, or negative), `checkBodySize` clones the request and reads its body stream chunk by chunk. The running total is compared against `maxBytes` after each chunk. The stream is cancelled and HTTP 413 is returned as soon as the total exceeds the limit.
 
 If the request has no body (`req.body` is `null`) the check passes immediately.
 

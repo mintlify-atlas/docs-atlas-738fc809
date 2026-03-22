@@ -137,10 +137,10 @@ Both helpers call the internal `shouldOmitData(data)` function before deciding w
 | `new Date(...)` | **Yes** | `Date` instances always have value |
 | `{ key: "value" }` | **Yes** | Non-empty plain object |
 | `[{ id: 1 }]` | **Yes** | Array with at least one item |
-| Any other non-null primitive | No* | Falls through to `false` in `shouldOmitData` |
+| `42`, `true`, `false`, etc. (non-null primitives) | **Yes** | Fall through to `return false` in `shouldOmitData` — included in `data` |
 
 <Note>
-  Numbers and booleans reach the final `return false` in `shouldOmitData`, which means they are **not** omitted — they would be included in `data`. In practice, route handlers pass objects or arrays, not raw primitives.
+  Numbers and booleans are not omitted — they are included in `data`. In practice, route handlers return objects or arrays, not raw primitives.
 </Note>
 
 ---

@@ -56,7 +56,7 @@ Label keys within each metric are canonicalized by sorting dimension names alpha
     **Type:** Counter. Incremented only on unhandled exceptions caught by the top-level `try/catch` in `routes.ts`. Labels: `method`, `route`.
   </Card>
   <Card title="rate_limit_hits_total" icon="ban">
-    **Type:** Counter. Incremented by `consumeOr429` in the rate-limiting utility when a request is rejected. Labels vary by limiter configuration.
+    **Type:** Counter. Incremented by `consumeOr429` in the rate-limiting utility when a request is rejected with HTTP 429. No labels — always recorded under the `_global_` key.
   </Card>
   <Card title="active_requests" icon="gauge">
     **Type:** Gauge. Incremented at the start of `handleRequest` and decremented once the response is built (including error paths). Reflects current in-flight concurrency.
@@ -111,7 +111,7 @@ Metric label values must never include raw request paths. Attacker-controlled pa
 ```typescript
 function getMetricRouteLabel(pathname: string): string {
   if (pathname === `${PREFIX}/health`) return "health";
-  if (pathname === `${PREFIX}/home")   return "home";
+  if (pathname === `${PREFIX}/home`)   return "home";
   if (pathname.startsWith(PREFIX))     return "not_found";
   return "outside_prefix";
 }

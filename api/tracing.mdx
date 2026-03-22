@@ -89,13 +89,17 @@ log("info", `${req.method} ${pathname}`, { traceId: traceHeaders["X-Trace-ID"] }
 
 ### `createChildSpan`
 
-Generates a child span ID derived from the current span. If no trace scope is active, a standalone random span ID is returned instead.
+Generates a new span ID in the context of the current trace scope. If no trace scope is active, a standalone random span ID is returned instead.
 
 ```typescript
 export function createChildSpan(): string
 ```
 
-**Returns:** A string combining a component of the current span ID with a new random 16-char hex segment, or a fresh standalone span ID if no context is active.
+**Returns:** A string derived from the current span combined with a new random 8-byte hex segment, or a fresh standalone 16-char hex span ID if no trace context is active.
+
+<Note>
+  `createChildSpan` is available for advanced use cases where you need to create sub-spans within a request scope (e.g. for instrumenting individual database calls or downstream HTTP requests). Most route handlers do not need to call it directly.
+</Note>
 
 ## How `X-Trace-ID` reaches the response
 

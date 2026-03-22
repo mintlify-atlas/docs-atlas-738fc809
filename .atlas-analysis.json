@@ -1,0 +1,137 @@
+{
+  "projectType": "framework",
+  "projectName": "bun-api-kit",
+  "projectDescription": "A minimal, production-ready HTTP API starter built on Bun.serve with zero framework overhead, providing structured routing, rate limiting, request correlation, security headers, and consistent JSON responses.",
+  "theme": "palm",
+  "primaryColor": "#7c7c7c",
+  "lightColor": "#111111",
+  "darkColor": "#cacaca",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": ["introduction", "quickstart", "project-structure"]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/request-pipeline",
+              "concepts/routing",
+              "concepts/json-responses",
+              "concepts/logging"
+            ]
+          },
+          {
+            "group": "Security",
+            "pages": [
+              "security/rate-limiting",
+              "security/body-size-limits",
+              "security/security-headers",
+              "security/cors"
+            ]
+          },
+          {
+            "group": "Observability",
+            "pages": [
+              "observability/request-correlation",
+              "observability/tracing",
+              "observability/metrics",
+              "observability/client-ip"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/adding-a-route",
+              "guides/input-validation",
+              "guides/environment-variables",
+              "guides/deployment"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Utilities",
+            "pages": [
+              "api/response",
+              "api/logger",
+              "api/validation",
+              "api/compression"
+            ]
+          },
+          {
+            "group": "Security Utilities",
+            "pages": [
+              "api/ratelimit",
+              "api/bodysize",
+              "api/securityheaders",
+              "api/cors-middleware"
+            ]
+          },
+          {
+            "group": "Observability Utilities",
+            "pages": [
+              "api/requestid",
+              "api/tracing",
+              "api/metrics",
+              "api/clientip"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Zero framework overhead using Bun.serve and standard Request/Response",
+    "File-based modular routing under src/routes/<name>/ mounted at /api/v1/<name>",
+    "Per-route in-memory rate limiting via rate-limiter-flexible",
+    "Per-route configurable body-size limits with Content-Length enforcement",
+    "Baseline security headers on every response (HSTS, CSP, X-Frame-Options, etc.)",
+    "Request correlation via X-Request-ID/X-Correlation-ID with AsyncLocalStorage",
+    "Distributed tracing with X-Trace-ID propagation",
+    "In-memory metrics (requests, duration, errors, rate limit hits, active requests)",
+    "Trusted-proxy-aware client IP resolution for logs and rate limiter keys",
+    "Consistent JSON API responses via apiSuccess/apiFailure helpers",
+    "Colorized structured logging with configurable levels via LOG_LEVEL env",
+    "CORS middleware with configurable origin allowlist and preflight handling",
+    "Gzip/brotli compression for JSON responses larger than 1 KiB",
+    "Zod-based input validation helpers for body, query, and route params",
+    "Health endpoint at /api/v1/health for Kubernetes/load balancer probes"
+  ],
+  "publicApiSurface": [
+    "apiSuccess(data?, init?) — Build a standard JSON success envelope",
+    "apiFailure(data?, init?) — Build a standard JSON failure envelope",
+    "createRouteLimiter({ points, durationSeconds, keyPrefix? }) — Create a per-route rate limiter",
+    "createRouteLimiter(...).consumeOr429(req, server) — Enforce rate limit, return 429 or null",
+    "createRouteBodyLimit({ maxBytes }) — Create a per-route body size enforcer",
+    "createRouteBodyLimit(...).checkBodySize(req) — Check body size, return 413 or null",
+    "defaultMaxBodyBytes() — Read MAX_BODY_BYTES env var with 1 MiB default",
+    "mergeSecurityHeaders(response) — Apply baseline security headers to a response",
+    "createCorsMiddleware() — Create CORS middleware instance",
+    "runWithRequestContext(req, fn) — Wrap handler in AsyncLocalStorage for request-scoped IDs",
+    "getRequestId() — Get current request's correlation ID",
+    "mirrorRequestIdHeader(response) — Mirror X-Request-ID onto response",
+    "runWithTrace(fn) — Wrap handler to generate distributed trace/span IDs",
+    "getTraceId() — Get current trace ID",
+    "getTraceHeaders() — Get X-Trace-ID header map",
+    "log(level, message, ctx?) — Colorized structured logger (debug/info/warn/error/success)",
+    "validateBody(schema, body) — Validate parsed body against Zod schema",
+    "validateQuery(schema, query) — Validate URL query params against Zod schema",
+    "validateParams(schema, params) — Validate route params against Zod schema",
+    "schemas.pagination, schemas.id, schemas.email — Pre-built Zod schemas",
+    "getClientIp(req, server) — Resolve client IP with trusted proxy support",
+    "getClientIpKey(req, server) — Get rate-limiter-safe IP key string",
+    "negotiateEncoding(acceptEncoding) — Parse Accept-Encoding header",
+    "compressResponse(body, encoding) — Compress response body if over 1 KiB",
+    "getMetricsSnapshot() — Get snapshot of all in-memory metrics",
+    "handleRequest(req, server) — Central request pipeline entry point",
+    "GET /api/v1/home — Example home route",
+    "GET /api/v1/health — Health check endpoint for probes"
+  ]
+}

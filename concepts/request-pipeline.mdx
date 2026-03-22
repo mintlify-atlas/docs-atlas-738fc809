@@ -1,0 +1,168 @@
+---
+title: "Request pipeline"
+description: "How every HTTP request flows through bun-api-kit from Bun.serve to the final compressed response."
+---
+
+Every request bun-api-kit receives passes through a fixed sequence of steps defined in `src/routes/routes.ts`. Understanding this pipeline helps you know where to add behavior, where errors surface, and what headers every response carries.
+
+## Pipeline overview
+
+<Steps>
+  <Step title="Bun.serve fetch handler">
+    `index.ts` calls `Bun.serve` and passes every `(req, server)` pair to `handleRequest`. A 30-second timeout timer starts immediately — if the request has not resolved by then, a `warn` log is written (the response is not interrupted).
+
+    ```typescript
+    const REQUEST_TIMEOUT_MS = 30_000;
+
+    const server = Bun.serve({
+      port: 3000,
+      fetch(req, server) {
+        const timeout = setTimeout(() => {
+          log("warn", `Request timeout exceeded for ${req.method} ${new URL(req.url).pathname}`);
+        }, REQUEST_TIMEOUT_MS);
+        const promise = handleRequest(req, server);
+        return promise.finally(() => clearTimeout(timeout));
+      },
+    });
+    ```
+  </Step>
+
+  <Step title="CORS preflight check">
+    The first thing `handleRequest` does is hand the request to the shared CORS middleware. If the request is an `OPTIONS` preflight, the middleware returns a response immediately. That response is passed through `finalize()` (security headers + `X-Trace-ID`) and returned — no route handlers are called.
+
+    ```typescript
+    const preflight = cors.handlePreflight(req);
+    if (preflight) {
+      return finalize(preflight);
+    }
+    ```
+  </Step>
+
+  <Step title="runWithRequestContext">
+    Non-preflight requests enter `runWithRequestContext` from `src/utils/requestid.ts`. This sets up `AsyncLocalStorage` so the current request's correlation ID (`X-Request-ID` / `X-Correlation-ID`, or a generated UUID) is available to every `log()` call during the request's lifetime.
+  </Step>
+
+  <Step title="runWithTrace">
+    Inside the request context, `runWithTrace` from `src/utils/tracing.ts` generates a trace ID and span ID for the request. The trace ID is included in access logs and reflected on the final response as `X-Trace-ID`.
+  </Step>
+
+  <Step title="Access log and metrics">
+    Before touching any route handler, the pipeline logs the incoming request and increments counters:
+
+    ```typescript
+    log(
+      "info",
+      `${req.method} ${pathname} client=${clientip(req, server)}`,
+      { traceId: traceHeaders["X-Trace-ID"] },
+    );
+
+    metrics.requests.total.increment({ method: req.method, route: routeLabel });
+    ```
+
+    The `routeLabel` is a bounded string (`health`, `home`, `not_found`, or `outside_prefix`) — raw request paths are never stored in metrics to prevent cardinality explosion.
+  </Step>
+
+  <Step title="Route handlers">
+    Handlers are iterated in the order they appear in the `handlers` array. Each handler returns either a `Response` (handled) or `null` (not mine). The first non-null return wins.
+
+    ```typescript
+    const handlers = [handleHealth, handleHome] as const;
+
+    for (const handler of handlers) {
+      const response = await handler(req, server, pathname);
+      if (response) {
+        // record latency, pass to buildResponse
+        return await buildResponse(response, req, encoding);
+      }
+    }
+    ```
+
+    Inside each handler, the check order is: **path + method → body size limit → rate limit → business logic**. This ensures unmatched requests never consume another route's quota.
+  </Step>
+
+  <Step title="respondNotFound">
+    If every handler returns `null`, the request is forwarded to `respondNotFound` from `src/routes/error/error.ts`. This function applies its own body size check and rate limiter (`keyPrefix: "notFound"`, 2000 requests/60 s) before returning a 404 `apiFailure` response.
+
+    ```typescript
+    return await buildResponse(await respondNotFound(req, server, pathname), req, encoding);
+    ```
+
+    <Note>`respondNotFound` is **not** in the `handlers` array — it is only called after all handlers have returned `null`.</Note>
+  </Step>
+
+  <Step title="finalize() — security headers and tracing">
+    Every handler response (including not-found and errors) passes through `finalize()` inside `buildResponse`:
+
+    ```typescript
+    function finalize(response: Response): Response {
+      const traceId = getTraceId();
+      if (traceId) {
+        response.headers.set("X-Trace-ID", traceId);
+      }
+      return mergeSecurityHeaders(mirrorRequestIdHeader(response));
+    }
+    ```
+
+    - **`X-Trace-ID`** — mirrors the trace ID from `runWithTrace` so callers can correlate logs.
+    - **`mirrorRequestIdHeader`** — sets `X-Request-ID` on the response to match the value used in logs.
+    - **`mergeSecurityHeaders`** — adds baseline headers: `X-Content-Type-Options`, `X-Frame-Options: DENY`, `Strict-Transport-Security`, `Content-Security-Policy`, `Referrer-Policy`, `Cache-Control: no-store`, and others.
+  </Step>
+
+  <Step title="CORS headers appended">
+    `buildResponse` appends CORS headers from the shared middleware before calling `finalize`:
+
+    ```typescript
+    let finalResponse = cors.appendCorsHeaders(response, req);
+    finalResponse = finalize(finalResponse);
+    ```
+  </Step>
+
+  <Step title="Compression">
+    After finalization, `buildResponse` optionally compresses the body. Compression is skipped for `HEAD` requests and for non-JSON responses. For JSON responses, the body is read and passed to `compressResponse`, which applies gzip or Brotli when the body exceeds 1 KiB and the client advertises support via `Accept-Encoding`.
+
+    ```typescript
+    const body = await finalResponse.text();
+    const compressed = compressResponse(body, encoding);
+    if (compressed) {
+      headers.set("Content-Encoding", compressed.encoding);
+      headers.set("Vary", "Accept-Encoding");
+    }
+    ```
+  </Step>
+</Steps>
+
+## Unhandled errors
+
+If a handler throws unexpectedly, the `try/catch` in `handleRequest` catches it, logs an `error` line with the trace ID, increments the error metric, and returns a 500 JSON response through `buildResponse` — so finalization and compression still run.
+
+```typescript
+log(
+  "error",
+  `Unhandled error processing ${req.method} ${pathname}: ${error instanceof Error ? error.message : String(error)}`,
+  { traceId: traceHeaders["X-Trace-ID"] },
+);
+return await buildResponse(
+  new Response(JSON.stringify({ success: false, data: { message: "Internal server error." } }), {
+    status: 500,
+    headers: { "Content-Type": "application/json; charset=utf-8" },
+  }),
+  req,
+  encoding,
+);
+```
+
+## Response headers on every response
+
+The table below lists headers guaranteed to appear on every finalized API response regardless of which route handled the request.
+
+| Header | Source |
+|--------|--------|
+| `X-Trace-ID` | `finalize()` via `src/utils/tracing.ts` |
+| `X-Request-ID` | `mirrorRequestIdHeader()` via `src/utils/requestid.ts` |
+| `X-Content-Type-Options` | `mergeSecurityHeaders()` |
+| `X-Frame-Options` | `mergeSecurityHeaders()` |
+| `Strict-Transport-Security` | `mergeSecurityHeaders()` |
+| `Content-Security-Policy` | `mergeSecurityHeaders()` |
+| `Cache-Control` | `mergeSecurityHeaders()` |
+| `Vary` | `buildResponse()` (only when compressed) |
+| `Content-Encoding` | `buildResponse()` (only when compressed) |

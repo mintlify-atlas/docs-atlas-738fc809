@@ -1,0 +1,136 @@
+---
+title: "Distributed tracing"
+description: "Per-request trace and span IDs generated via AsyncLocalStorage, included in access logs and surfaced on responses as X-Trace-ID."
+---
+
+Every request gets a unique trace ID and span ID at the start of the pipeline. Both IDs live in an `AsyncLocalStorage` scope so any code running during the request lifecycle can read them without explicit parameter passing. The trace ID is written to every access log line and set as the `X-Trace-ID` response header, giving clients a stable value to reference when reporting failures.
+
+## Starting a trace scope
+
+`runWithTrace` generates a 128-bit trace ID (32 hex characters) and a 64-bit span ID (16 hex characters), stores them in async-local storage, then calls `fn` with the trace ID as its argument.
+
+```typescript
+export function runWithTrace<T>(fn: (traceId: string) => Promise<T>): Promise<T>
+```
+
+IDs are generated using `randomBytes` from `node:crypto`:
+
+- **Trace ID** — `randomBytes(16).toString("hex")` — 32 hex characters
+- **Span ID** — `randomBytes(8).toString("hex")` — 16 hex characters
+
+In `routes.ts`, `runWithTrace` is nested inside `runWithRequestContext` so both scopes are active simultaneously:
+
+```typescript
+return runWithRequestContext(req, () =>
+  runWithTrace(async () => {
+    const traceHeaders = getTraceHeaders();
+    // traceId is now available via getTraceId() and getTraceHeaders()
+  }),
+);
+```
+
+## Reading trace and span IDs
+
+```typescript
+export function getTraceId(): string | undefined
+export function getSpanId(): string | undefined
+```
+
+Both return `undefined` when called outside a `runWithTrace` scope. Use them inside route handlers or utility code to attach tracing context to outgoing calls or structured log fields.
+
+## Getting trace headers
+
+`getTraceHeaders` returns a plain object suitable for spreading into outgoing request headers or log context. It returns an empty object when called outside a trace scope.
+
+```typescript
+export function getTraceHeaders(): Record<string, string>
+// Returns: { "X-Trace-ID": "<32-hex-char trace id>" }
+// Returns: {} when called outside a trace scope
+```
+
+Example — forwarding the trace ID to an upstream service:
+
+```typescript
+import { getTraceHeaders } from "../../utils/tracing.ts";
+
+const upstream = await fetch("https://internal.example.com/data", {
+  headers: {
+    ...getTraceHeaders(),
+    "Content-Type": "application/json",
+  },
+});
+```
+
+## Trace ID in access logs
+
+`routes.ts` reads `getTraceHeaders()` immediately after entering the trace scope and passes the value as context to the access log:
+
+```typescript
+const traceHeaders = getTraceHeaders();
+
+log(
+  "info",
+  `${req.method} ${pathname} client=${clientip(req, server)}`,
+  { traceId: traceHeaders["X-Trace-ID"] },
+);
+```
+
+This produces log lines like:
+
+```
+[INFO] GET /api/v1/home client=203.0.113.5 (x-forwarded-for) rid=550e8400... traceId=3f2a8c...
+```
+
+Unhandled errors also record the trace ID, making it possible to find the full request context from an error log alone:
+
+```typescript
+log(
+  "error",
+  `Unhandled error processing ${req.method} ${pathname}: ${error.message}`,
+  { traceId: traceHeaders["X-Trace-ID"] },
+);
+```
+
+## X-Trace-ID on responses
+
+The `finalize` function in `routes.ts` runs on every outgoing response. It reads the current trace ID and sets it as the `X-Trace-ID` response header:
+
+```typescript
+function finalize(response: Response): Response {
+  const traceId = getTraceId();
+  if (traceId) {
+    response.headers.set("X-Trace-ID", traceId);
+  }
+  return mergeSecurityHeaders(mirrorRequestIdHeader(response));
+}
+```
+
+`finalize` is applied to successful handler responses, not-found responses, and 500 error responses — so `X-Trace-ID` is present on every reply.
+
+## Correlating client failures with server logs
+
+<Steps>
+  <Step title="Client captures X-Trace-ID">
+    The API response includes an `X-Trace-ID` header with the request's trace ID. Log this value in your client or API gateway.
+  </Step>
+  <Step title="Search server logs by traceId">
+    Use the captured value to filter server-side logs. Every log line for that request includes `traceId=<value>` as a structured field.
+  </Step>
+  <Step title="Locate the full request timeline">
+    The access log entry (method, path, client IP, `rid`, `traceId`) and any route-level logs share the same trace ID, giving a complete picture of what happened.
+  </Step>
+</Steps>
+
+<Tip>
+  Because `X-Trace-ID` and `X-Request-ID` are both set on every response, you can use either value for log lookups. `X-Trace-ID` is always generated server-side; `X-Request-ID` may be an ID the client supplied.
+</Tip>
+
+## Child spans
+
+For tracking internal async sub-operations within a single request, `createChildSpan` derives a new span ID from the current trace scope:
+
+```typescript
+export function createChildSpan(): string
+```
+
+Returns a new span ID string. If called outside a trace scope it returns a standalone random span ID. Use this when you need to track parallel or sequential sub-operations within one request without starting a new top-level trace.

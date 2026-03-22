@@ -1,0 +1,148 @@
+---
+title: "CORS middleware"
+description: "Configurable CORS handling with origin whitelisting, preflight support, and deny-by-default in production."
+---
+
+`createCorsMiddleware` returns a middleware object with two methods: one for responding to browser preflight requests before route dispatch, and one for appending CORS headers to normal responses.
+
+## Function
+
+### `createCorsMiddleware(config?)`
+
+Creates a reusable CORS middleware instance. Configuration is merged over the project defaults at call time — the resolved origin list is fixed for the lifetime of the instance.
+
+<ParamField path="config" type="CorsConfig">
+  Optional overrides for the default CORS configuration.
+  <Expandable title="properties">
+    <ParamField path="origin" type="string | string[] | ((origin: string) => boolean)">
+      Allowed browser origins. Accepts a wildcard string `"*"`, an array of exact origin strings, or a predicate function. Defaults to the value resolved from the `CORS_ALLOWED_ORIGINS` environment variable (see below).
+    </ParamField>
+    <ParamField path="methods" type="string[]">
+      HTTP methods advertised in preflight responses. Default: `["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]`.
+    </ParamField>
+    <ParamField path="allowedHeaders" type="string[]">
+      Request headers the browser is allowed to send. Default: `["Content-Type", "Authorization", "X-Request-ID", "X-Trace-ID"]`.
+    </ParamField>
+    <ParamField path="exposedHeaders" type="string[]">
+      Response headers the browser is allowed to read via JavaScript. Default: `["X-Request-ID", "X-Trace-ID"]`.
+    </ParamField>
+    <ParamField path="credentials" type="boolean">
+      Whether to include `Access-Control-Allow-Credentials: true`. Default: `false`.
+    </ParamField>
+    <ParamField path="maxAge" type="number">
+      Preflight cache duration in seconds sent as `Access-Control-Max-Age`. Default: `86400` (24 hours).
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+**Returns** an object with `handlePreflight` and `appendCorsHeaders` methods.
+
+---
+
+### `cors.handlePreflight(req)`
+
+Handles browser preflight (`OPTIONS`) requests before route dispatch.
+
+<ParamField path="req" type="Request" required>
+  The incoming `Request` object.
+</ParamField>
+
+**Returns** `Response | null`:
+
+- **`null`** — the request is not an `OPTIONS` request, has no `Origin` header, or has no `Access-Control-Request-Method` header. Continue to route dispatch.
+- **`Response(null, { status: 204 })`** — the origin is allowed. The response carries the CORS headers listed below.
+- **`Response(null, { status: 403 })`** — the origin is present but not in the allowlist. Return immediately.
+
+#### Preflight response headers
+
+| Header | Condition |
+|--------|-----------|
+| `Access-Control-Allow-Origin` | Always set to the request `Origin` when allowed |
+| `Access-Control-Allow-Methods` | Set when `Access-Control-Request-Method` is present |
+| `Access-Control-Allow-Headers` | Echoes `Access-Control-Request-Headers` when present |
+| `Access-Control-Expose-Headers` | Set when `exposedHeaders` is non-empty |
+| `Access-Control-Allow-Credentials` | Set to `"true"` only when `credentials: true` in config |
+| `Access-Control-Max-Age` | Set when `maxAge` is non-zero |
+
+---
+
+### `cors.appendCorsHeaders(response, req)`
+
+Appends CORS headers to a normal (non-preflight) response when the request origin is in the allowlist.
+
+<ParamField path="response" type="Response" required>
+  The outgoing `Response` to annotate.
+</ParamField>
+
+<ParamField path="req" type="Request" required>
+  The original `Request`, used to read the `Origin` header.
+</ParamField>
+
+**Returns** `Response`. If the request has no `Origin` header or the origin is not allowed, the original response is returned unmodified.
+
+#### Headers set on allowed cross-origin responses
+
+| Header | Value |
+|--------|-------|
+| `Access-Control-Allow-Origin` | The exact request `Origin` value |
+| `Access-Control-Allow-Credentials` | `"true"` — only when `credentials: true` in config |
+| `Access-Control-Expose-Headers` | Comma-separated `exposedHeaders` list — when non-empty |
+
+## Origin resolution and defaults
+
+The origin rule is resolved once when `createCorsMiddleware()` is first called (at module load time in `routes.ts`):
+
+1. If `CORS_ALLOWED_ORIGINS` is set, its value is split on commas, trimmed, and used as the explicit allowlist.
+2. If `CORS_ALLOWED_ORIGINS` is not set and `NODE_ENV=production`, the origin list defaults to `[]` — **all cross-origin requests are denied**.
+3. If `CORS_ALLOWED_ORIGINS` is not set and `NODE_ENV` is anything other than `production`, the origin defaults to `"*"` — all origins are allowed (permissive local development mode).
+
+<Warning>
+  In production, do **not** rely on the permissive default. Set `CORS_ALLOWED_ORIGINS` explicitly to the browser origins that should be allowed, for example `CORS_ALLOWED_ORIGINS=https://app.example.com,https://admin.example.com`.
+</Warning>
+
+## Environment variables
+
+| Variable | Description |
+|----------|-------------|
+| `CORS_ALLOWED_ORIGINS` | Comma-separated list of allowed browser origins. When set, takes priority over the `NODE_ENV`-based default. |
+| `NODE_ENV` | When set to `production` and `CORS_ALLOWED_ORIGINS` is not configured, all cross-origin requests are denied by default. |
+
+## Usage in `routes.ts`
+
+A single shared instance is created at module scope. Preflight handling runs first, before route dispatch. CORS headers are appended to every finalized response inside `buildResponse`:
+
+```typescript
+// src/routes/routes.ts
+
+/** Shared CORS middleware instance for the whole HTTP pipeline. */
+const cors = createCorsMiddleware();
+
+export async function handleRequest(
+  req: Request,
+  server: Bun.Server<undefined>,
+): Promise<Response> {
+  // 1. Handle OPTIONS preflight before any route logic runs
+  const preflight = cors.handlePreflight(req);
+  if (preflight) {
+    return finalize(preflight);
+  }
+
+  // ... route dispatch ...
+}
+
+async function buildResponse(
+  response: Response,
+  req: Request,
+  encoding: ReturnType<typeof negotiateEncoding>,
+): Promise<Response> {
+  // 2. Append CORS headers to all non-preflight responses
+  let finalResponse = cors.appendCorsHeaders(response, req);
+  finalResponse = finalize(finalResponse);
+  // ... compression ...
+  return finalResponse;
+}
+```
+
+<Note>
+  CORS headers are reflected per-request using the exact `Origin` value from the incoming request rather than a wildcard, even when the effective allowlist is `"*"`. This ensures `Access-Control-Allow-Origin` is always a single concrete origin on non-preflight responses.
+</Note>

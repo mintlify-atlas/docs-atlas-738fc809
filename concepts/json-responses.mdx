@@ -1,0 +1,150 @@
+---
+title: "JSON responses"
+description: "The apiSuccess and apiFailure helpers that produce every JSON response in bun-api-kit."
+---
+
+All route handlers must return JSON through `apiSuccess` or `apiFailure` from `src/utils/response.ts`. Using raw `Response.json()` or manually constructing JSON strings is not permitted for API responses.
+
+## Response shape
+
+Every response body follows the same contract:
+
+```typescript
+{ success: true }                        // no payload
+{ success: true, data: <value> }         // with payload
+
+{ success: false }                       // no detail
+{ success: false, data: <value> }        // with detail
+```
+
+`success` is always present. `data` is only present when there is a meaningful payload — empty values are omitted automatically.
+
+## Function signatures
+
+```typescript
+export function apiSuccess(data?: unknown, init?: ResponseInit): Response
+export function apiFailure(data?: unknown, init?: ResponseInit): Response
+```
+
+Both functions set `Content-Type: application/json; charset=utf-8` explicitly. The `init` argument accepts any `ResponseInit` fields — most commonly `{ status: 404 }` for failures.
+
+## The shouldOmitData rule
+
+The internal `shouldOmitData` function decides whether `data` appears in the serialized body:
+
+```typescript
+function shouldOmitData(data: unknown): boolean {
+  if (data === undefined || data === null) return true;
+  if (data === "") return true;
+  if (Array.isArray(data) && data.length === 0) return true;
+  if (typeof data === "object" && data !== null && !Array.isArray(data)) {
+    if (data instanceof Date) return false;       // Dates are always kept
+    return Object.keys(data as object).length === 0; // empty plain objects omitted
+  }
+  return false;
+}
+```
+
+### When data is omitted vs included
+
+| Value passed as `data` | `data` in response body |
+|------------------------|-------------------------|
+| `undefined` | omitted |
+| `null` | omitted |
+| `""` (empty string) | omitted |
+| `[]` (empty array) | omitted |
+| `{}` (empty plain object) | omitted |
+| `new Date()` | **included** |
+| `{ message: "Not found" }` | **included** |
+| `{ status: "healthy", timestamp: "..." }` | **included** |
+| `[1, 2, 3]` | **included** |
+| `"hello"` (non-empty string) | **included** |
+
+<Note>The omit rule exists to avoid emitting useless `"data": null` or `"data": {}` fields that carry no information for the caller.</Note>
+
+## Examples
+
+### Success with no payload
+
+When a route has nothing to return beyond confirmation:
+
+```typescript
+return apiSuccess();
+```
+
+```json
+{ "success": true }
+```
+
+### Success with a payload
+
+The health route returns structured data:
+
+```typescript
+return apiSuccess({
+  status: "healthy",
+  timestamp: new Date().toISOString(),
+});
+```
+
+```json
+{
+  "success": true,
+  "data": {
+    "status": "healthy",
+    "timestamp": "2026-03-22T10:00:00.000Z"
+  }
+}
+```
+
+### Failure with a message
+
+The not-found handler returns a failure with an explanatory message:
+
+```typescript
+return apiFailure(
+  { message: "The requested route does not exist." },
+  { status: 404 },
+);
+```
+
+```json
+{
+  "success": false,
+  "data": { "message": "The requested route does not exist." }
+}
+```
+
+### Failure with no detail
+
+When there is nothing useful to include in `data`:
+
+```typescript
+return apiFailure(null, { status: 400 });
+```
+
+```json
+{ "success": false }
+```
+
+### Internal server error (pipeline fallback)
+
+When an unhandled exception is caught in `routes.ts`, the pipeline constructs the response directly to keep the 500 path simple:
+
+```typescript
+new Response(
+  JSON.stringify({ success: false, data: { message: "Internal server error." } }),
+  { status: 500, headers: { "Content-Type": "application/json; charset=utf-8" } },
+)
+```
+
+## Custom headers
+
+Extra response headers can be passed via `init.headers`. `apiSuccess` and `apiFailure` merge them in without overwriting `Content-Type`:
+
+```typescript
+return apiSuccess(payload, {
+  status: 201,
+  headers: { "X-Resource-ID": newId },
+});
+```

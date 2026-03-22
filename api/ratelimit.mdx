@@ -1,0 +1,165 @@
+---
+title: "Rate limiter"
+description: "Per-route in-memory fixed-window rate limiting built on rate-limiter-flexible."
+---
+
+`createRouteLimiter` builds a dedicated `RateLimiterMemory` instance for a single route. Each call returns an independent limiter so limits never bleed across routes.
+
+## Types
+
+### `RouteRateLimitConfig`
+
+Configuration passed to `createRouteLimiter`.
+
+<ParamField path="points" type="number" required>
+  Maximum number of requests allowed within `durationSeconds`.
+</ParamField>
+
+<ParamField path="durationSeconds" type="number" required>
+  Length of the fixed window in seconds. The counter resets after this period.
+</ParamField>
+
+<ParamField path="keyPrefix" type="string">
+  Optional prefix passed to the underlying `RateLimiterMemory` instance. Useful for namespacing when multiple limiters share a storage backend in the future.
+</ParamField>
+
+### `RouteRateLimiter`
+
+The object returned by `createRouteLimiter`.
+
+<ResponseField name="limiter" type="RateLimiterMemory">
+  Direct reference to the underlying `rate-limiter-flexible` `RateLimiterMemory` instance. Exposed for testing and introspection; normal route code only needs `consumeOr429`.
+</ResponseField>
+
+<ResponseField name="consumeOr429" type="(req: Request, server: Bun.Server) => Promise<Response | null>">
+  Consume one point for the resolved client IP. Returns `null` when the request is within quota, or a `Response` when the quota is exhausted or the key is invalid.
+</ResponseField>
+
+## Functions
+
+### `createRouteLimiter(config)`
+
+Creates a dedicated in-memory fixed-window limiter for a single route.
+
+```typescript
+import { createRouteLimiter } from "../../utils/security/ratelimit.ts";
+
+const limiter = createRouteLimiter({
+  points: 300,
+  durationSeconds: 60,
+  keyPrefix: "myRoute",
+});
+```
+
+<ParamField path="config" type="RouteRateLimitConfig" required>
+  See `RouteRateLimitConfig` above.
+</ParamField>
+
+**Returns** `RouteRateLimiter`.
+
+---
+
+### `consumeOr429(req, server)`
+
+Consumes one point from the limiter for the client's IP address and returns:
+
+- **`null`** — the request is within quota and may proceed.
+- **`Response`** — the quota is exhausted (HTTP 429) or the resolved key is invalid (HTTP 400). Return this response immediately from the route handler.
+
+<ParamField path="req" type="Request" required>
+  The incoming `Request` object passed by `Bun.serve`.
+</ParamField>
+
+<ParamField path="server" type="Bun.Server" required>
+  The `Bun.Server` instance — required so `getClientIpKey` can call `server.requestIP(req)` to resolve the direct peer address.
+</ParamField>
+
+#### 429 response
+
+When the quota is exhausted the response body is:
+
+```json
+{
+  "success": false,
+  "data": {
+    "message": "Too many requests. Please try again later."
+  }
+}
+```
+
+The response also includes a `Retry-After` header containing the number of whole seconds the client must wait before the window resets (minimum `1`).
+
+#### 400 response for invalid key
+
+If the resolved client IP fails key validation, the limiter returns HTTP 400 instead of attempting to consume a point:
+
+```json
+{
+  "success": false,
+  "data": {
+    "message": "Invalid request context."
+  }
+}
+```
+
+## Key validation
+
+The rate-limit key is the raw string returned by `getClientIpKey` (the resolved client IP address). Before the key is passed to `RateLimiterMemory.consume`, it is validated against:
+
+| Rule | Detail |
+|------|--------|
+| Non-empty | An empty string is always rejected |
+| Max length | Keys longer than **128 characters** are rejected |
+| Character set | Must match `/^[a-zA-Z0-9.:\-_]+$/` |
+
+Any key that fails validation causes `consumeOr429` to return HTTP 400 without touching the limiter state.
+
+<Note>
+  Forwarded IP headers (`x-forwarded-for`, `x-real-ip`) are only trusted when the direct peer matches `TRUSTED_PROXY_RANGES` or `TRUSTED_PROXY_IPS`. See the [Client IP](/api/clientip) reference for the full resolution order.
+</Note>
+
+## Usage example
+
+The pattern below mirrors the conventions used in every route in this project. Body size and rate limit enforcement happen **after** the path/method check so unrelated requests are not charged.
+
+```typescript
+import { PREFIX } from "../../routes/constants.ts";
+import { createRouteBodyLimit, defaultMaxBodyBytes } from "../../utils/security/bodysize.ts";
+import { createRouteLimiter } from "../../utils/security/ratelimit.ts";
+import { apiSuccess, apiFailure } from "../../utils/response.ts";
+import { log } from "../../utils/logger.ts";
+
+const bodyLimit = createRouteBodyLimit({ maxBytes: defaultMaxBodyBytes() });
+const limiter = createRouteLimiter({
+  points: 5000,
+  durationSeconds: 60,
+  keyPrefix: "home",
+});
+
+export async function handle(
+  req: Request,
+  server: Bun.Server<undefined>,
+  pathname?: string,
+): Promise<Response | null> {
+  if (req.method !== "GET" || pathname !== `${PREFIX}/home`) {
+    return null;
+  }
+
+  const bodySizeResponse = await bodyLimit.checkBodySize(req, pathname);
+  if (bodySizeResponse) {
+    return bodySizeResponse;
+  }
+
+  const rateLimitResponse = await limiter.consumeOr429(req, server);
+  if (rateLimitResponse) {
+    return rateLimitResponse;
+  }
+
+  log("success", `GET ${PREFIX}/home`);
+  return apiSuccess({ message: "Hello from bun-api-kit." });
+}
+```
+
+<Warning>
+  `createRouteLimiter` must be called **once** at module scope, not inside the handler function. Calling it on every request would create a new limiter instance on each request, discarding all accumulated state.
+</Warning>

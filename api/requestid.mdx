@@ -1,0 +1,136 @@
+---
+title: "Request ID"
+description: "Per-request correlation ID stored in AsyncLocalStorage and mirrored on outbound responses."
+---
+
+Every request handled by `handleRequest` is wrapped in `runWithRequestContext`, which resolves a stable ID for the lifetime of that request. The same ID is written to every log line via `log()` and reflected on the response as `X-Request-ID`.
+
+## Resolution order
+
+<Steps>
+  <Step title="X-Request-ID header">
+    The incoming `X-Request-ID` header is read and trimmed. If non-empty, it is used as the request ID (truncated to 128 characters).
+  </Step>
+  <Step title="X-Correlation-ID header">
+    If `X-Request-ID` is absent or empty, `X-Correlation-ID` is tried with the same rules.
+  </Step>
+  <Step title="Generated UUID">
+    If neither header is present, a new UUID is generated with `randomUUID()` from `node:crypto`.
+  </Step>
+</Steps>
+
+<Note>
+  Incoming IDs are capped at **128 characters** before being stored. This prevents abnormally long client-supplied values from bloating logs or response headers.
+</Note>
+
+## Functions
+
+### `getRequestId`
+
+Resolves the request ID from the incoming request headers or generates a fresh UUID. This is a pure function — it does not read or write the async context.
+
+```typescript
+export function getRequestId(req: Request): string
+```
+
+<ParamField path="req" type="Request" required>
+  The incoming Bun/Web `Request` object. Headers `x-request-id` and `x-correlation-id` are checked in that order.
+</ParamField>
+
+**Returns:** A non-empty string — either the client-supplied header value (max 128 chars) or a freshly generated UUID.
+
+---
+
+### `runWithRequestContext`
+
+Wraps `fn` in an `AsyncLocalStorage` run scope so that `getCurrentRequestId()` and `log()` resolve the correct ID for the entire asynchronous call chain of this request, with no need to thread the ID through every function argument.
+
+```typescript
+export function runWithRequestContext<T>(
+  req: Request,
+  fn: () => Promise<T>,
+): Promise<T>
+```
+
+<ParamField path="req" type="Request" required>
+  The incoming request. `getRequestId(req)` is called internally to resolve the ID before entering the storage scope.
+</ParamField>
+
+<ParamField path="fn" type="() => Promise<T>" required>
+  An async callback that runs inside the request-scoped context. Any code that calls `getCurrentRequestId()` or `log()` from within this callback will see the resolved ID.
+</ParamField>
+
+**Returns:** `Promise<T>` — the value resolved by `fn`.
+
+```typescript
+// In routes.ts — the entry point wraps each request:
+return runWithRequestContext(req, () =>
+  runWithTrace(async () => {
+    // log() here will automatically append rid=<id>
+    log("info", `${req.method} ${pathname}`);
+    // ...
+  }),
+);
+```
+
+---
+
+### `getCurrentRequestId`
+
+Reads the request ID stored in the active `AsyncLocalStorage` context. Returns `undefined` when called outside a `runWithRequestContext` scope (for example, at module initialization time or in background timers).
+
+```typescript
+export function getCurrentRequestId(): string | undefined
+```
+
+**Returns:** The current request ID string, or `undefined` if no context is active.
+
+<Warning>
+  This function returns `undefined` outside a `runWithRequestContext` scope. Always guard the return value or use `mirrorRequestIdHeader`, which handles the missing-context case for you.
+</Warning>
+
+---
+
+### `mirrorRequestIdHeader`
+
+Sets the `X-Request-ID` response header to the current request's ID. If no context is active (i.e., `getCurrentRequestId()` returns `undefined`), the response is returned unchanged.
+
+This is called inside `finalize()` in `routes.ts` so every response automatically carries the correlation ID that was logged for that request.
+
+```typescript
+export function mirrorRequestIdHeader(response: Response): Response
+```
+
+<ParamField path="response" type="Response" required>
+  The `Response` object to annotate. The function mutates `response.headers` in place by calling `headers.set("X-Request-ID", id)`.
+</ParamField>
+
+**Returns:** The same `Response` object, with `X-Request-ID` set (or unmodified if no context is active).
+
+```typescript
+// In routes.ts finalize():
+function finalize(response: Response): Response {
+  const traceId = getTraceId();
+  if (traceId) {
+    response.headers.set("X-Trace-ID", traceId);
+  }
+  return mergeSecurityHeaders(mirrorRequestIdHeader(response));
+}
+```
+
+## Automatic `rid=` in logs
+
+`log()` from `src/utils/logger.ts` reads `getCurrentRequestId()` automatically and appends `rid=<id>` to every log line emitted within a `runWithRequestContext` scope. No extra wiring is needed in individual route handlers.
+
+```
+[INFO] GET /api/v1/home client=10.0.0.5 (x-forwarded-for) traceId=3f2a... rid=550e8400-e29b-41d4-a716-446655440000
+```
+
+## Types
+
+```typescript
+/** Async-local payload shared across the request lifecycle. */
+type RequestIdStore = {
+  requestId: string;
+};
+```

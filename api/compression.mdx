@@ -1,0 +1,141 @@
+---
+title: "Compression"
+description: "Content-Encoding negotiation and response compression for JSON payloads larger than 1 KiB."
+---
+
+Compression is applied automatically in `src/routes/routes.ts` as part of `buildResponse()`. Route handlers do not interact with it directly — this reference documents the two functions that power it so you understand the behavior and can reason about when responses will or will not be compressed.
+
+## Supported encodings
+
+| Encoding | Algorithm | Source |
+|----------|-----------|--------|
+| `gzip` | DEFLATE wrapped in gzip framing | `node:zlib` `gzipSync` |
+| `br` | Brotli | `node:zlib` `brotliCompressSync` |
+| `deflate` | Raw DEFLATE | `node:zlib` `deflateSync` |
+| `identity` | No compression | (passthrough) |
+
+---
+
+## `negotiateEncoding`
+
+Parse the `Accept-Encoding` request header and return the best supported encoding.
+
+```typescript
+import { negotiateEncoding } from "../utils/compression.ts";
+
+export function negotiateEncoding(acceptEncoding: string | null): Encoding
+```
+
+<ParamField path="acceptEncoding" type="string | null" required>
+  The value of the `Accept-Encoding` request header. Pass `null` (or omit the header) to receive `"identity"`.
+</ParamField>
+
+**Return type:** `"gzip" | "br" | "deflate" | "identity"`
+
+### Selection logic
+
+1. Split the header value on `,` and parse each token's optional `q=` weight (default weight `1`).
+2. Sort tokens by weight descending.
+3. Return the first token that is `gzip`, `br`, or `deflate`.
+4. If none match (or the header is absent/null), return `"identity"`.
+
+```typescript
+negotiateEncoding("gzip, deflate, br");     // → "gzip"  (first match in weight order)
+negotiateEncoding("br;q=0.9, gzip;q=1.0"); // → "gzip"  (higher q-value wins)
+negotiateEncoding("br;q=1.0, gzip;q=0.9"); // → "br"
+negotiateEncoding("identity");              // → "identity"
+negotiateEncoding(null);                    // → "identity"
+```
+
+<Note>
+  The function picks the **strongest supported encoding by q-value**, not by algorithm strength. If the client sends equal weights, the first match in declaration order wins.
+</Note>
+
+---
+
+## `compressResponse`
+
+Compress a response body, but only when the payload is at or above the 1 KiB threshold.
+
+```typescript
+import { compressResponse } from "../utils/compression.ts";
+
+export function compressResponse(
+  body: string | ArrayBuffer,
+  encoding: Encoding,
+): { body: Uint8Array; encoding: Encoding } | null
+```
+
+<ParamField path="body" type="string | ArrayBuffer" required>
+  The response body to compress. Strings are encoded to `Uint8Array` via `TextEncoder` before compression.
+</ParamField>
+
+<ParamField path="encoding" type='`"gzip" | "br" | "deflate" | "identity"`' required>
+  The encoding selected by `negotiateEncoding`. When `"identity"` is passed, the function returns `null` immediately.
+</ParamField>
+
+**Return type:** `{ body: Uint8Array; encoding: Encoding } | null`
+
+Returns `null` in two cases:
+- `encoding` is `"identity"` — no compression requested.
+- The serialized body is smaller than **1024 bytes** (1 KiB) — compression overhead is not worth it.
+
+Returns `{ body, encoding }` when the payload is large enough and a supported encoding was requested.
+
+### The 1 KiB threshold
+
+```typescript
+const COMPRESSION_THRESHOLD = 1024; // bytes
+```
+
+Responses under 1024 bytes are returned as-is. This avoids CPU overhead for small payloads where the compressed output would be the same size or larger than the original.
+
+---
+
+## How it fits into the request pipeline
+
+In `src/routes/routes.ts`, the `buildResponse()` function wires both helpers together:
+
+```typescript
+// 1. Negotiate encoding once per request, before the handler runs
+const encoding = negotiateEncoding(req.headers.get("Accept-Encoding"));
+
+// 2. After the handler returns a response, apply compression
+async function buildResponse(response: Response, req: Request, encoding): Promise<Response> {
+  // ... apply CORS, security, and trace headers ...
+
+  // Only compress JSON responses; skip HEAD requests
+  if (req.method === "HEAD" || !finalResponse.headers.get("Content-Type")?.includes("application/json")) {
+    return finalResponse;
+  }
+
+  const body = await finalResponse.text();
+  const compressed = compressResponse(body, encoding);
+
+  if (!compressed) {
+    // Under threshold or identity — return plain text body
+    return new Response(body, { status, statusText, headers });
+  }
+
+  // Compressed — set Content-Encoding and Vary headers
+  const headers = new Headers(finalResponse.headers);
+  headers.set("Content-Encoding", compressed.encoding);
+  headers.set("Vary", "Accept-Encoding");
+  return new Response(compressed.body, { status, statusText, headers });
+}
+```
+
+### Headers set on compressed responses
+
+| Header | Value | Purpose |
+|--------|-------|---------|
+| `Content-Encoding` | `gzip`, `br`, or `deflate` | Tells the client how the body is encoded |
+| `Vary` | `Accept-Encoding` | Instructs caches to key on this header |
+
+<Note>
+  Compression is only applied to responses with `Content-Type: application/json`. Non-JSON responses (e.g. future binary endpoints) pass through without compression. `HEAD` requests also skip the compression step.
+</Note>
+
+<Tip>
+  Because `negotiateEncoding` is called before the route handler runs, there is zero per-handler setup required. All JSON responses from `apiSuccess` and `apiFailure` are automatically eligible for compression.
+</Tip>

@@ -1,0 +1,80 @@
+---
+title: "Introduction"
+description: "bun-api-kit is a minimal, production-ready HTTP API starter built directly on Bun.serve with zero framework overhead."
+---
+
+## What is bun-api-kit?
+
+bun-api-kit is a template for building HTTP APIs with [Bun](https://bun.com/). It uses `Bun.serve` and the standard `Request` / `Response` model directly — no framework sits between your code and the runtime.
+
+Instead of abstracting away the HTTP layer, bun-api-kit gives you a clean, auditable request pipeline with only the cross-cutting infrastructure a production service actually needs: structured logging, request correlation, rate limiting, body-size enforcement, security headers, CORS, compression, input validation, and distributed tracing.
+
+## Why not Express, Hono, or Fastify?
+
+Most API starters bolt a framework onto the runtime. That introduces a hidden middleware chain, magic routing behavior, and dependencies you didn't choose. bun-api-kit takes the opposite approach:
+
+- **No hidden middleware chain.** The full request pipeline is in `src/routes/routes.ts` — one file, readable top to bottom.
+- **No magic routing.** Routes are registered in an explicit array. First match wins. No regex, no wildcards, no decorators.
+- **No framework dependency.** The only runtime dependencies are `rate-limiter-flexible` (for per-route in-memory throttling) and `zod` (for optional input validation).
+- **Full control over every response.** All JSON responses go through `apiSuccess` / `apiFailure` helpers that enforce a consistent `{ success, data? }` contract.
+
+## What's included
+
+<CardGroup cols={2}>
+  <Card title="File-based routing" icon="folder-tree">
+    Route modules live under `src/routes/<name>/` and are mounted at `/api/v1/<name>`. Add a folder, export a `handle` function, register it — done.
+  </Card>
+  <Card title="Request correlation" icon="link">
+    Every request gets a unique `rid` from `X-Request-ID`, `X-Correlation-ID`, or a generated UUID. It appears in every log line and is mirrored back on the response.
+  </Card>
+  <Card title="Per-route rate limiting" icon="gauge">
+    Independent in-memory limiters via `rate-limiter-flexible`. Each route configures its own `points` / `durationSeconds` so a heavy endpoint never starves a light one.
+  </Card>
+  <Card title="Body-size enforcement" icon="weight-hanging">
+    Per-route `Content-Length` limits enforced before any business logic runs. Configurable per endpoint or via the `MAX_BODY_BYTES` environment variable (default 1 MiB).
+  </Card>
+  <Card title="Security headers" icon="shield">
+    `mergeSecurityHeaders` applies HSTS, CSP, `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy`, `Permissions-Policy`, and `Cache-Control: no-store` to every response automatically.
+  </Card>
+  <Card title="Structured logging" icon="terminal">
+    Color-coded, level-aware console output (`debug` · `info` · `warn` · `error` · `success`) with automatic `rid=` and `traceId=` context on every line inside a request scope.
+  </Card>
+  <Card title="Distributed tracing" icon="diagram-project">
+    Each request gets a generated trace id and span id via `src/utils/tracing.ts`. The trace id is included in access logs and mirrored on responses as `X-Trace-ID`.
+  </Card>
+  <Card title="Response compression" icon="file-zipper">
+    JSON responses larger than 1 KiB are compressed with gzip or Brotli based on the client's `Accept-Encoding` header.
+  </Card>
+  <Card title="CORS middleware" icon="globe">
+    Configurable origin allowlist with credential support and preflight handling. Production default is deny-by-default unless `CORS_ALLOWED_ORIGINS` is set.
+  </Card>
+  <Card title="Input validation" icon="check">
+    Zod-based `validateBody`, `validateQuery`, and `validateParams` helpers with pre-built schemas for pagination, id, and email.
+  </Card>
+  <Card title="In-memory metrics" icon="chart-bar">
+    `http_requests_total`, `http_request_duration_ms`, `http_errors_total`, `rate_limit_hits_total`, and `active_requests` tracked per bounded route label.
+  </Card>
+  <Card title="Health endpoint" icon="heart-pulse">
+    `GET /api/v1/health` returns a minimal readiness payload suitable for Kubernetes probes and load balancers.
+  </Card>
+</CardGroup>
+
+## Requirements
+
+- [Bun](https://bun.com/) — current stable release
+- TypeScript **^5**
+
+<Note>
+  bun-api-kit uses Bun-native APIs only (`Bun.serve`, Bun's WebSocket support). Node.js is not supported as the runtime.
+</Note>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Get a working API running in under 2 minutes.
+  </Card>
+  <Card title="Project structure" icon="map" href="/project-structure">
+    Understand every file and directory in the repo.
+  </Card>
+</CardGroup>

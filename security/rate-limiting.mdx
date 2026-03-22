@@ -1,0 +1,162 @@
+---
+title: "Rate limiting"
+description: "Per-route in-memory rate limiting using RateLimiterMemory from rate-limiter-flexible."
+---
+
+Each route in bun-api-kit has its own independent rate limiter backed by [`rate-limiter-flexible`](https://www.npmjs.com/package/rate-limiter-flexible)'s `RateLimiterMemory`. Limits are enforced per client IP and are completely isolated — exhausting the quota on one route does not affect any other route.
+
+## How it works
+
+You call `createRouteLimiter` once per route module at module load time. The returned object exposes `consumeOr429`, which you call inside the route handler after the request has been matched to this route but before any business logic runs.
+
+```typescript
+// src/utils/security/ratelimit.ts
+export type RouteRateLimitConfig = {
+  points: number;
+  durationSeconds: number;
+  keyPrefix?: string;
+};
+
+export type RouteRateLimiter = {
+  readonly limiter: RateLimiterMemory;
+  consumeOr429(
+    req: Request,
+    server: Bun.Server<undefined>,
+  ): Promise<Response | null>;
+};
+
+export function createRouteLimiter(
+  config: RouteRateLimitConfig,
+): RouteRateLimiter;
+```
+
+### Configuration params
+
+<ParamField path="points" type="number" required>
+  The maximum number of requests allowed from one client IP within the window defined by `durationSeconds`.
+</ParamField>
+
+<ParamField path="durationSeconds" type="number" required>
+  The length of the fixed window in seconds. The counter resets at the end of each window.
+</ParamField>
+
+<ParamField path="keyPrefix" type="string">
+  An optional string prepended to the limiter key stored in memory. Use a unique value per route (for example `"home"`, `"notFound"`) to keep per-route counters isolated when inspecting the in-memory store.
+</ParamField>
+
+## `consumeOr429`
+
+`consumeOr429(req, server)` consumes one point from the client's quota. It returns:
+
+- **`null`** — the request is within quota; continue processing.
+- **`Response`** — the quota was exhausted; return this response immediately.
+
+The returned response on exhaustion is an HTTP **429** with the following shape and a `Retry-After` header:
+
+```json
+{
+  "success": false,
+  "data": {
+    "message": "Too many requests. Please try again later."
+  }
+}
+```
+
+The `Retry-After` value is the ceiling of the milliseconds remaining before the window resets, converted to whole seconds (minimum `1`).
+
+<Note>
+  If the resolved client IP produces an invalid rate-limit key (empty, over 128 characters, or containing disallowed characters), `consumeOr429` returns an HTTP **400** instead of **429**.
+</Note>
+
+## Client IP as the rate-limit key
+
+The limiter key is the client IP resolved by `getClientIpKey` from `src/utils/clientip.ts`. Resolution follows this order:
+
+1. `Bun.Server.requestIP(req)` always identifies the immediate peer.
+2. If the peer matches `TRUSTED_PROXY_RANGES` or `TRUSTED_PROXY_IPS`, the first address in `x-forwarded-for` is used when valid.
+3. Otherwise, if trusted, `x-real-ip` is used.
+4. If no trusted proxy is configured, the socket address is used directly.
+
+This means forwarded headers are only trusted when the immediate peer is explicitly listed as a trusted proxy, preventing IP spoofing by untrusted clients.
+
+## Route example
+
+The pattern below mirrors the real `home` route (`src/routes/home/home.ts`).
+
+```typescript
+import { PREFIX } from "../constants.ts";
+import { createRouteLimiter } from "../../utils/security/ratelimit.ts";
+import { createRouteBodyLimit, defaultMaxBodyBytes } from "../../utils/security/bodysize.ts";
+import { apiSuccess } from "../../utils/response.ts";
+import { log } from "../../utils/logger.ts";
+
+// Instantiate once at module load — shared across all requests to this route.
+const rateLimit = createRouteLimiter({
+  points: 5000,
+  durationSeconds: 60,
+  keyPrefix: "home",
+});
+
+const bodyLimit = createRouteBodyLimit({
+  maxBytes: defaultMaxBodyBytes(),
+});
+
+export async function handle(
+  req: Request,
+  server: Bun.Server<undefined>,
+  pathname?: string,
+): Promise<Response | null> {
+  const path = pathname ?? new URL(req.url).pathname;
+
+  // 1. Match path and method first — unrelated requests must not consume quota.
+  if (path !== `${PREFIX}/home` || req.method !== "GET") {
+    return null;
+  }
+
+  // 2. Check body size.
+  const tooLarge = await bodyLimit.checkBodySize(req, path);
+  if (tooLarge) return tooLarge;
+
+  // 3. Check rate limit.
+  const limited = await rateLimit.consumeOr429(req, server);
+  if (limited) return limited;
+
+  // 4. Business logic.
+  log("success", `GET ${path}`);
+  return apiSuccess();
+}
+```
+
+<Warning>
+  Always check path and method **before** calling `consumeOr429`. Calling it before matching wastes quota for requests that belong to a different route or should return 404.
+</Warning>
+
+## Independent limits per route
+
+Each call to `createRouteLimiter` produces a separate `RateLimiterMemory` instance with its own in-memory counter store. The home route (`5000 points / 60 s`) and a write-heavy route (`300 points / 60 s`) have completely independent counters — a client that exhausts the write route is not blocked from the read route.
+
+## Not-found limiter
+
+Unknown routes handled by `respondNotFound` in `src/routes/error/error.ts` have their own dedicated limiter:
+
+```typescript
+const rateLimit = createRouteLimiter({
+  points: 2000,
+  durationSeconds: 60,
+  keyPrefix: "notFound",
+});
+```
+
+This prevents attackers from flooding random paths to exhaust resources without any of the cost falling on legitimate route limiters.
+
+## In-memory storage
+
+All counters live in-process memory. There is no Redis or external store. This means:
+
+- Counters reset on process restart.
+- Limits are not shared across multiple server instances (horizontal scaling).
+- No additional infrastructure is required for single-instance deployments.
+
+<Tip>
+  To share limits across multiple instances, swap `RateLimiterMemory` for `RateLimiterRedis` from the same `rate-limiter-flexible` package and update `createRouteLimiter` accordingly.
+</Tip>

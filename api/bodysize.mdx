@@ -1,0 +1,151 @@
+---
+title: "Body size limits"
+description: "Per-route request body enforcement with a Content-Length fast path and a streaming fallback."
+---
+
+`createRouteBodyLimit` returns a route-local enforcer that rejects oversized request bodies before business logic runs. The limit is checked from `Content-Length` when available, and falls back to reading the request stream when the header is missing or invalid.
+
+## Functions
+
+### `defaultMaxBodyBytes()`
+
+Resolves the default body limit from the environment.
+
+```typescript
+import { defaultMaxBodyBytes } from "../../utils/security/bodysize.ts";
+
+const limit = defaultMaxBodyBytes(); // e.g. 1048576
+```
+
+Reads the `MAX_BODY_BYTES` environment variable and parses it as a base-10 integer. If the variable is absent, empty, non-finite, or not a positive integer, the function returns the hard-coded default of **1,048,576 bytes (1 MiB)**.
+
+<ResponseField name="return" type="number">
+  Body limit in bytes. Always a positive integer.
+</ResponseField>
+
+---
+
+### `createRouteBodyLimit(config)`
+
+Creates a route-local body limiter.
+
+<ParamField path="config" type="RouteBodyLimitConfig" required>
+  <Expandable title="properties">
+    <ParamField path="maxBytes" type="number" required>
+      Maximum allowed request body size in bytes. Requests with a body that exceeds this value are rejected with HTTP 413.
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+**Returns** `RouteBodyLimiter`.
+
+---
+
+### `checkBodySize(req, pathname?)`
+
+Inspects the body size and returns:
+
+- **`null`** — the request is within the configured limit and may proceed.
+- **`Response`** — the body is too large (HTTP 413). Return this response immediately from the route handler.
+
+<ParamField path="req" type="Request" required>
+  The incoming `Request` object. When the `Content-Length` fast path is not available the body is read from a cloned request stream.
+</ParamField>
+
+<ParamField path="pathname" type="string">
+  Optional pre-parsed pathname used in warning log messages. When omitted the path is extracted from `new URL(req.url).pathname`.
+</ParamField>
+
+#### 413 response body
+
+```json
+{
+  "success": false,
+  "data": {
+    "message": "Request body too large."
+  }
+}
+```
+
+## Enforcement strategy
+
+### Content-Length fast path
+
+When the request includes a valid `Content-Length` header, the declared byte count is compared against `maxBytes`. If it exceeds the limit the request is rejected immediately without reading the body stream. This path is preferred because it avoids any I/O.
+
+### Stream reading fallback
+
+When `Content-Length` is absent, zero, or cannot be parsed as a finite non-negative integer, `checkBodySize` clones the request and reads its body stream chunk by chunk. The running total is compared against `maxBytes` after each chunk. The stream is cancelled and HTTP 413 is returned as soon as the total exceeds the limit.
+
+If the request has no body (`req.body` is `null`) the check passes immediately.
+
+## Warning logs
+
+Both rejection paths emit a `warn`-level log entry before returning the 413 response. The log format is:
+
+```
+[WARN] {METHOD} {path} rejected: content-length {observed} bytes exceeds route limit {limit} bytes
+[WARN] {METHOD} {path} rejected: streamed body {observed} bytes exceeds route limit {limit} bytes
+```
+
+The first form is used when `Content-Length` is present; the second when the limit is exceeded while streaming.
+
+<Note>
+  Body size enforcement should happen **after** the route's path and method check but **before** rate limiting and business logic, so unrelated requests do not consume another route's body quota.
+</Note>
+
+## Usage example
+
+```typescript
+import { PREFIX } from "../../routes/constants.ts";
+import {
+  createRouteBodyLimit,
+  defaultMaxBodyBytes,
+} from "../../utils/security/bodysize.ts";
+import { createRouteLimiter } from "../../utils/security/ratelimit.ts";
+import { apiSuccess } from "../../utils/response.ts";
+import { log } from "../../utils/logger.ts";
+
+// Route-specific limit: 64 KiB for a lightweight JSON endpoint
+const bodyLimit = createRouteBodyLimit({ maxBytes: 65536 });
+
+// Or follow the global MAX_BODY_BYTES env default
+// const bodyLimit = createRouteBodyLimit({ maxBytes: defaultMaxBodyBytes() });
+
+const limiter = createRouteLimiter({ points: 300, durationSeconds: 60 });
+
+export async function handle(
+  req: Request,
+  server: Bun.Server<undefined>,
+  pathname?: string,
+): Promise<Response | null> {
+  if (req.method !== "POST" || pathname !== `${PREFIX}/items`) {
+    return null;
+  }
+
+  // Check body size before any other work
+  const bodySizeResponse = await bodyLimit.checkBodySize(req, pathname);
+  if (bodySizeResponse) {
+    return bodySizeResponse;
+  }
+
+  const rateLimitResponse = await limiter.consumeOr429(req, server);
+  if (rateLimitResponse) {
+    return rateLimitResponse;
+  }
+
+  const body = await req.json();
+  log("success", `POST ${PREFIX}/items`);
+  return apiSuccess({ created: true });
+}
+```
+
+<Warning>
+  Like `createRouteLimiter`, `createRouteBodyLimit` must be called **once at module scope**. Creating a new instance per request discards the configuration object each time and adds unnecessary allocation overhead.
+</Warning>
+
+## Environment variable
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MAX_BODY_BYTES` | `1048576` | Global body limit in bytes read by `defaultMaxBodyBytes()`. Invalid or empty values fall back to 1 MiB. |

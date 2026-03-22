@@ -1,0 +1,133 @@
+---
+title: "Client IP resolution"
+description: "Single resolution function for client IP addresses used by both access logs and the rate limiter, with configurable trusted-proxy CIDR support."
+---
+
+Client IP resolution is handled in one place — `src/utils/clientip.ts` — so logs and the rate limiter always agree on who sent a request. Forwarded headers (`X-Forwarded-For`, `X-Real-IP`) are trusted only when the direct TCP peer matches the configured trusted proxy list.
+
+## Resolution order
+
+<Steps>
+  <Step title="Read the direct peer via server.requestIP">
+    `server.requestIP(req)` is always called first to identify the immediate TCP peer. This is the only value that cannot be spoofed by an HTTP header.
+  </Step>
+  <Step title="Check TRUSTED_PROXY_RANGES / TRUSTED_PROXY_IPS">
+    The peer address is matched against the rules parsed from `TRUSTED_PROXY_RANGES` (or `TRUSTED_PROXY_IPS`). If no match is found, forwarded headers are ignored entirely and the socket address is used.
+  </Step>
+  <Step title="Use X-Forwarded-For when the peer is trusted">
+    If the peer is trusted, the first address in the `X-Forwarded-For` header is read and validated as a legal IPv4 or IPv6 string. If valid, it is returned as the client IP with source `"forwarded"`.
+  </Step>
+  <Step title="Fall back to X-Real-IP">
+    If `X-Forwarded-For` is absent or invalid, `X-Real-IP` is checked. If it contains a valid IP, it is returned with source `"real-ip"`.
+  </Step>
+  <Step title="Fall back to socket address">
+    If neither forwarded header yields a valid IP (or the peer is untrusted), the raw Bun socket address is used. The `clientip()` convenience function labels this as `(direct)` in log output.
+  </Step>
+</Steps>
+
+<Warning>
+  If `TRUSTED_PROXY_RANGES` is not configured, forwarded headers are **never** trusted regardless of where the request originates. A misconfigured or absent trusted-proxy list means all requests are logged and rate-limited by their socket address.
+</Warning>
+
+## Functions
+
+### getClientIp
+
+Resolves and returns the full result, including the address string and the source that produced it.
+
+```typescript
+export type ClientIpSource = "forwarded" | "real-ip" | "socket" | "unknown";
+
+export type ClientIpResult = {
+  address: string;
+  source: ClientIpSource;
+};
+
+export function getClientIp(
+  req: Request,
+  server: Bun.Server<undefined>,
+): ClientIpResult
+```
+
+Use `getClientIp` when you need both the address and the source (for example, to emit structured logs with resolution metadata).
+
+### getClientIpKey
+
+Returns only the address string. This is used by `consumeOr429` in the rate-limiter as the per-client identity key.
+
+```typescript
+export function getClientIpKey(
+  req: Request,
+  server: Bun.Server<undefined>,
+): string
+```
+
+The rate limiter and the access log use the same underlying `getClientIp` call, so a request that is logged as `203.0.113.5 (x-forwarded-for)` is also counted against the `203.0.113.5` bucket in the limiter.
+
+### clientip
+
+Convenience alias that formats the result as a single string for use in log messages.
+
+```typescript
+export function clientip(
+  req: Request,
+  server: Bun.Server<undefined>,
+): string
+```
+
+Output format depends on the resolution source:
+
+| Source | Example output |
+|---|---|
+| `forwarded` | `203.0.113.5 (x-forwarded-for)` |
+| `real-ip` | `203.0.113.5 (x-real-ip)` |
+| `socket` | `203.0.113.5 (direct)` |
+| `unknown` | `unknown` |
+
+This is the function used in the access log inside `routes.ts`:
+
+```typescript
+log(
+  "info",
+  `${req.method} ${pathname} client=${clientip(req, server)}`,
+  { traceId: traceHeaders["X-Trace-ID"] },
+);
+```
+
+## Configuring trusted proxies
+
+Set `TRUSTED_PROXY_RANGES` in your environment to a comma-separated list of IPv4 addresses or CIDR ranges that are allowed to supply `X-Forwarded-For` and `X-Real-IP` headers.
+
+```bash
+# .env.example
+TRUSTED_PROXY_RANGES=127.0.0.1/32,10.0.0.0/8
+```
+
+Both exact IPs and CIDR notation are supported:
+
+```bash
+# Exact IPs
+TRUSTED_PROXY_RANGES=10.0.0.1,10.0.0.2
+
+# CIDR ranges
+TRUSTED_PROXY_RANGES=10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+
+# Mixed
+TRUSTED_PROXY_RANGES=127.0.0.1/32,10.0.0.0/8
+```
+
+`TRUSTED_PROXY_IPS` is a backward-compatible alternative that accepts the same format. When both variables are set, `TRUSTED_PROXY_RANGES` takes precedence:
+
+```typescript
+const TRUSTED_PROXY_RULES = parseTrustedProxyRules(
+  Bun.env.TRUSTED_PROXY_RANGES ?? Bun.env.TRUSTED_PROXY_IPS ?? "",
+);
+```
+
+<Note>
+  Rules are parsed once at startup. Changing these environment variables requires restarting the server.
+</Note>
+
+## IP validation
+
+All IP values read from forwarded headers are validated against strict IPv4 and IPv6 regexes before use. Addresses longer than 45 characters or containing unexpected characters are rejected and the resolver falls through to the next candidate in the resolution order. This prevents malformed or injected header values from reaching logs or rate-limiter keys.

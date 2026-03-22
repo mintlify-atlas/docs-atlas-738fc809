@@ -1,0 +1,158 @@
+---
+title: "In-memory metrics"
+description: "Lightweight in-process metrics registry tracking request counts, latency, errors, rate limit hits, and active concurrency — all keyed by bounded route labels."
+---
+
+bun-api-kit ships a zero-dependency, in-memory metrics registry. There is no sidecar, no push endpoint, and no external dependency. The registry is intentionally minimal: it provides counters, histograms, and gauges sufficient for production health monitoring and is designed to be read on demand via `getMetricsSnapshot()`.
+
+## Reading the snapshot
+
+`getMetricsSnapshot` returns a plain JSON-serializable object containing the current state of all registered metrics.
+
+```typescript
+export function getMetricsSnapshot(): Record<string, unknown>
+```
+
+Example snapshot shape:
+
+```json
+{
+  "http_requests_total": {
+    "method=GET;route=home": 1420,
+    "method=GET;route=health": 8800
+  },
+  "http_request_duration_ms": {
+    "method=GET;route=home": {
+      "count": 1420,
+      "min": 0.8,
+      "max": 42.1,
+      "avg": 3.2
+    }
+  },
+  "http_errors_total": {
+    "method=GET;route=not_found": 12
+  },
+  "rate_limit_hits_total": {
+    "_global_": 5
+  },
+  "active_requests": {
+    "_global_": 3
+  }
+}
+```
+
+Label keys within each metric are canonicalized by sorting dimension names alphabetically, so `method=GET;route=home` and `route=home;method=GET` resolve to the same entry.
+
+## Tracked metrics
+
+<CardGroup cols={2}>
+  <Card title="http_requests_total" icon="arrow-up">
+    **Type:** Counter. Incremented once per request after the route label is determined. Labels: `method` (HTTP verb), `route` (bounded label).
+  </Card>
+  <Card title="http_request_duration_ms" icon="clock">
+    **Type:** Histogram. Records wall-clock latency from the start of `handleRequest` to handler completion. Labels: `method`, `route`. Snapshot includes `count`, `min`, `max`, and `avg`.
+  </Card>
+  <Card title="http_errors_total" icon="circle-exclamation">
+    **Type:** Counter. Incremented only on unhandled exceptions caught by the top-level `try/catch` in `routes.ts`. Labels: `method`, `route`.
+  </Card>
+  <Card title="rate_limit_hits_total" icon="ban">
+    **Type:** Counter. Incremented by `consumeOr429` in the rate-limiting utility when a request is rejected. Labels vary by limiter configuration.
+  </Card>
+  <Card title="active_requests" icon="gauge">
+    **Type:** Gauge. Incremented at the start of `handleRequest` and decremented once the response is built (including error paths). Reflects current in-flight concurrency.
+  </Card>
+</CardGroup>
+
+### Type signatures
+
+The internal interfaces used by the registry:
+
+```typescript
+interface Counter {
+  increment(labels?: MetricLabels): void;
+  value(labels?: MetricLabels): number;
+}
+
+interface Histogram {
+  observe(value: number, labels?: MetricLabels): void;
+}
+
+interface Gauge {
+  increment(labels?: MetricLabels): void;
+  decrement(labels?: MetricLabels): void;
+  value(labels?: MetricLabels): number;
+}
+
+type MetricLabels = Record<string, string>;
+```
+
+The public handles exported from `metrics.ts`:
+
+```typescript
+export const metrics = {
+  requests: {
+    total: Counter,        // http_requests_total
+    duration: Histogram,   // http_request_duration_ms
+    errors: Counter,       // http_errors_total
+    active: Gauge,         // active_requests
+  },
+  rateLimit: {
+    hits: Counter,         // rate_limit_hits_total
+  },
+};
+```
+
+## Bounded route labels
+
+Metric label values must never include raw request paths. Attacker-controlled paths would produce unbounded cardinality, growing the in-memory registry without limit and potentially leaking path details into monitoring output.
+
+`getMetricRouteLabel` in `routes.ts` maps every incoming pathname to one of four stable labels before any metric is recorded:
+
+```typescript
+function getMetricRouteLabel(pathname: string): string {
+  if (pathname === `${PREFIX}/health`) return "health";
+  if (pathname === `${PREFIX}/home")   return "home";
+  if (pathname.startsWith(PREFIX))     return "not_found";
+  return "outside_prefix";
+}
+```
+
+| Label | Meaning |
+|---|---|
+| `health` | Matched `/api/v1/health` exactly |
+| `home` | Matched `/api/v1/home` exactly |
+| `not_found` | Under `/api/v1/` but no handler matched |
+| `outside_prefix` | Entirely outside the `/api/v1/` prefix |
+
+<Warning>
+  When adding a new route, add a corresponding branch to `getMetricRouteLabel` so traffic to that route gets its own label instead of counting as `not_found`.
+</Warning>
+
+## How metrics flow through the pipeline
+
+The full recording sequence inside `handleRequest` in `routes.ts`:
+
+```typescript
+// 1. Gauge up — request is now in flight
+metrics.requests.active.increment();
+
+// 2. Counter — one tick per request, labeled by method + route
+metrics.requests.total.increment({ method: req.method, route: routeLabel });
+
+// 3. Histogram — latency in ms from performance.now() at entry
+metrics.requests.duration.observe(latency, { method: req.method, route: routeLabel });
+
+// 4. Gauge down — request is done
+metrics.requests.active.decrement();
+
+// 5. Error counter — only on unhandled exceptions
+metrics.requests.errors.increment({ method: req.method, route: routeLabel });
+```
+
+Steps 3–5 run in `finally`-equivalent paths so the gauge always decrements even when a handler throws.
+
+## Health endpoint considerations
+
+<Note>
+  `/api/v1/health` is intended for load balancer and Kubernetes liveness/readiness probes. Keep its response payload small and stable. Avoid embedding verbose metrics data in health responses — use a separate protected endpoint to expose `getMetricsSnapshot()` output.
+</Note>

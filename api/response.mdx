@@ -1,0 +1,185 @@
+---
+title: "Response helpers"
+description: "Build standard JSON API envelopes with consistent Content-Type and optional data payloads."
+---
+
+`apiSuccess` and `apiFailure` are the only way route handlers should produce JSON responses in bun-api-kit. They guarantee a uniform envelope shape, correct `Content-Type`, and suppress empty `data` wrappers automatically.
+
+## Functions
+
+### `apiSuccess`
+
+Build a JSON success envelope with `"success": true`.
+
+```typescript
+import { apiSuccess } from "../../utils/response.ts";
+
+export function apiSuccess(data?: unknown, init?: ResponseInit): Response
+```
+
+<ParamField path="data" type="unknown">
+  Optional payload to include under the `data` key. Omitted when the value carries no useful content — see [shouldOmitData](#the-shouldomitdata-rule) below.
+</ParamField>
+
+<ParamField path="init" type="ResponseInit">
+  Standard `ResponseInit` options (`status`, `statusText`, `headers`). `Content-Type` is always forced to `application/json; charset=utf-8` and cannot be overridden via `init.headers`.
+</ParamField>
+
+**Return type:** `Response`
+
+#### Output shapes
+
+When `data` is omitted by `shouldOmitData`:
+
+```json
+{ "success": true }
+```
+
+When `data` carries a meaningful value:
+
+```json
+{ "success": true, "data": { "id": "abc", "name": "example" } }
+```
+
+#### Examples
+
+```typescript
+// No payload — health check, simple acknowledgement
+return apiSuccess();
+// → { "success": true }
+
+// With payload
+return apiSuccess({ id: "u_123", email: "user@example.com" });
+// → { "success": true, "data": { "id": "u_123", "email": "user@example.com" } }
+
+// Custom status
+return apiSuccess({ created: true }, { status: 201 });
+// → HTTP 201, { "success": true, "data": { "created": true } }
+
+// Empty array — data key is suppressed
+return apiSuccess([]);
+// → { "success": true }
+
+// Array with items — data key is included
+return apiSuccess([{ id: 1 }, { id: 2 }]);
+// → { "success": true, "data": [{ "id": 1 }, { "id": 2 }] }
+
+// Date — always included
+return apiSuccess(new Date("2024-01-01"));
+// → { "success": true, "data": "2024-01-01T00:00:00.000Z" }
+```
+
+---
+
+### `apiFailure`
+
+Build a JSON failure envelope with `"success": false`.
+
+```typescript
+import { apiFailure } from "../../utils/response.ts";
+
+export function apiFailure(data?: unknown, init?: ResponseInit): Response
+```
+
+<ParamField path="data" type="unknown">
+  Optional error payload under the `data` key. Same `shouldOmitData` logic applies.
+</ParamField>
+
+<ParamField path="init" type="ResponseInit">
+  Standard `ResponseInit` options. `Content-Type` is always `application/json; charset=utf-8`.
+</ParamField>
+
+**Return type:** `Response`
+
+#### Output shapes
+
+```json
+{ "success": false }
+```
+
+```json
+{ "success": false, "data": { "message": "The requested route does not exist." } }
+```
+
+#### Examples
+
+```typescript
+// Generic failure with no detail
+return apiFailure(undefined, { status: 400 });
+// → HTTP 400, { "success": false }
+
+// Validation error message
+return apiFailure({ message: "email: Invalid email" }, { status: 400 });
+// → HTTP 400, { "success": false, "data": { "message": "email: Invalid email" } }
+
+// Not found
+return apiFailure({ message: "The requested route does not exist." }, { status: 404 });
+// → HTTP 404, { "success": false, "data": { "message": "The requested route does not exist." } }
+
+// Rate limit — empty object suppressed
+return apiFailure({}, { status: 429 });
+// → HTTP 429, { "success": false }
+```
+
+---
+
+## The `shouldOmitData` rule
+
+Both helpers call the internal `shouldOmitData(data)` function before deciding whether to include the `data` key. This prevents empty wrappers like `{ "success": true, "data": null }` from leaking into responses.
+
+| Value | `data` key included? | Reason |
+|-------|----------------------|--------|
+| `undefined` | No | No value provided |
+| `null` | No | Explicit null carries no payload |
+| `""` (empty string) | No | Empty string is not meaningful |
+| `[]` (empty array) | No | Zero-length list adds no information |
+| `{}` (empty plain object) | No | Object with no own keys is empty |
+| `new Date(...)` | **Yes** | `Date` instances always have value |
+| `{ key: "value" }` | **Yes** | Non-empty plain object |
+| `[{ id: 1 }]` | **Yes** | Array with at least one item |
+| Any other non-null primitive | No* | Falls through to `false` in `shouldOmitData` |
+
+<Note>
+  Numbers and booleans reach the final `return false` in `shouldOmitData`, which means they are **not** omitted — they would be included in `data`. In practice, route handlers pass objects or arrays, not raw primitives.
+</Note>
+
+---
+
+## Content-Type
+
+Both functions unconditionally set:
+
+```
+Content-Type: application/json; charset=utf-8
+```
+
+This header is set first and protected from override: any `Content-Type` supplied via `init.headers` is ignored for this key. Other headers in `init.headers` are merged in normally.
+
+---
+
+## Response shape reference
+
+<ResponseField name="success" type="boolean" required>
+  `true` for `apiSuccess`, `false` for `apiFailure`. Always present.
+</ResponseField>
+
+<ResponseField name="data" type="unknown">
+  Present only when `shouldOmitData` returns `false`. Type mirrors whatever was passed as the first argument.
+
+  <Expandable title="common data shapes">
+    <ResponseField name="message" type="string">
+      Human-readable error or status description, commonly used with `apiFailure`.
+    </ResponseField>
+    <ResponseField name="(any key)" type="unknown">
+      Route-specific payload fields returned from `apiSuccess`.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+---
+
+## Usage rule
+
+<Warning>
+  Route handlers **must** use `apiSuccess` or `apiFailure` for all JSON responses. Do not use `Response.json()` or construct raw `Response` objects with JSON bodies — this bypasses the standard envelope and `Content-Type` enforcement.
+</Warning>

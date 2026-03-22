@@ -1,0 +1,115 @@
+---
+title: "Project structure"
+description: "A map of every file and directory in bun-api-kit and the role each one plays."
+---
+
+## Directory layout
+
+```
+bun-api-kit/
+├── index.ts                          # Server bootstrap (Bun.serve on port 3000)
+├── package.json                      # Package metadata, scripts, dependencies
+├── .env.example                      # Environment variable template
+├── src/
+│   ├── routes/
+│   │   ├── routes.ts                 # Central request pipeline
+│   │   ├── constants.ts              # PREFIX (/api/v1), LOG_COLORS, LOG_RESET
+│   │   ├── home/
+│   │   │   └── home.ts              # GET /api/v1/home
+│   │   ├── health/
+│   │   │   └── health.ts            # GET /api/v1/health
+│   │   └── error/
+│   │       └── error.ts             # 404 not-found handler (fallback only)
+│   └── utils/
+│       ├── logger.ts                 # log() helper — colorized, level-aware
+│       ├── requestid.ts              # Request correlation (AsyncLocalStorage)
+│       ├── tracing.ts                # Distributed tracing (X-Trace-ID)
+│       ├── metrics.ts                # In-memory request metrics
+│       ├── response.ts               # apiSuccess / apiFailure helpers
+│       ├── clientip.ts               # Client IP resolution (proxy-aware)
+│       ├── compression.ts            # gzip/br response compression
+│       ├── validation.ts             # Zod-based input validation helpers
+│       └── security/
+│           ├── securityheaders.ts    # mergeSecurityHeaders
+│           ├── bodysize.ts           # createRouteBodyLimit / checkBodySize
+│           ├── ratelimit.ts          # createRouteLimiter / consumeOr429
+│           └── cors.ts               # createCorsMiddleware
+```
+
+## File reference
+
+| Path | Role |
+|------|------|
+| `index.ts` | Bun server bootstrap. Binds port 3000, passes `(req, server)` to `handleRequest`, logs startup with `log("info", ...)`. Includes a 30-second request timeout warning. |
+| `package.json` | Package name `bun-api-kit`. Scripts: `start` runs `bun --watch index.ts`. Runtime deps: `rate-limiter-flexible`, `zod`. |
+| `.env.example` | Template for all supported environment variables with production-oriented defaults. |
+| `src/routes/routes.ts` | The full request pipeline: CORS preflight → request context → trace context → access log → metrics → route handlers → 404 fallback → response finalization (security headers, compression, `X-Request-ID`, `X-Trace-ID`). |
+| `src/routes/constants.ts` | Exports `PREFIX` (`/api/v1`), `LOG_COLORS` (ANSI codes per log level), and `LOG_RESET`. |
+| `src/routes/home/home.ts` | `GET /api/v1/home`. Enforces the default body limit and a 5,000 req/60 s rate limit. Returns `{ "success": true }`. |
+| `src/routes/health/health.ts` | `GET /api/v1/health`. Rate-limited at 100 req/60 s. Returns `{ "success": true, "data": { "status": "healthy", "timestamp": "..." } }`. Suitable for Kubernetes probes. |
+| `src/routes/error/error.ts` | Not-found handler (`respondNotFound`). Rate-limited, body-capped, returns HTTP 404 with `{ "success": false, "data": { "message": "The requested route does not exist." } }`. Not registered in `handlers` — called only after all handlers return `null`. |
+| `src/utils/logger.ts` | `log(level, message, ctx?)`. Levels: `debug`, `info`, `warn`, `error`, `success`. Colorized output using `LOG_COLORS`. Appends `rid=` and any `ctx` key=value pairs. Controlled by `LOG_LEVEL` env (default: `info`). |
+| `src/utils/requestid.ts` | `runWithRequestContext` stores the request id in `AsyncLocalStorage`. Reads `X-Request-ID` or `X-Correlation-ID` (max 128 chars), else generates a UUID. `mirrorRequestIdHeader` sets `X-Request-ID` on the final response. |
+| `src/utils/tracing.ts` | `runWithTrace` assigns a trace id and span id per request. `getTraceHeaders` returns `{ "X-Trace-ID": "..." }`. The trace id is logged on every access log line and set on the final response. |
+| `src/utils/metrics.ts` | In-memory counters and histograms: `http_requests_total`, `http_request_duration_ms`, `http_errors_total`, `rate_limit_hits_total`, `active_requests`. Access via `getMetricsSnapshot()`. Route labels are bounded (`home`, `health`, `not_found`, `outside_prefix`) — never raw request paths. |
+| `src/utils/response.ts` | `apiSuccess(data?)` and `apiFailure(data?, init?)` build `application/json` responses. `data` is omitted when it is `undefined`, `null`, `""`, `[]`, or an empty object. |
+| `src/utils/clientip.ts` | Single IP resolution function used by both access logs and rate-limiter keys. Trusts `x-forwarded-for` / `x-real-ip` only when the direct peer matches `TRUSTED_PROXY_RANGES` / `TRUSTED_PROXY_IPS`. |
+| `src/utils/compression.ts` | `negotiateEncoding` parses `Accept-Encoding`. `compressResponse` applies gzip or Brotli to JSON responses larger than 1 KiB. |
+| `src/utils/validation.ts` | `validateBody`, `validateQuery`, `validateParams` Zod helpers. Pre-built schemas for pagination, id, and email. |
+| `src/utils/security/securityheaders.ts` | `mergeSecurityHeaders` adds HSTS, CSP, `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin`, `X-XSS-Protection: 0`, `Permissions-Policy`, `Cache-Control: no-store`, `X-Download-Options: noopen`, `X-Permitted-Cross-Domain-Policies: none` if not already set. |
+| `src/utils/security/bodysize.ts` | `createRouteBodyLimit({ maxBytes })` returns a `checkBodySize(req)` function. Returns HTTP 413 JSON if `Content-Length` or the streamed body exceeds the limit. `defaultMaxBodyBytes()` reads `MAX_BODY_BYTES` (default 1 MiB). |
+| `src/utils/security/ratelimit.ts` | `createRouteLimiter({ points, durationSeconds, keyPrefix? })` returns a `consumeOr429(req, server)` function backed by `RateLimiterMemory`. Returns HTTP 429 with a `Retry-After` header when the quota is exhausted. |
+| `src/utils/security/cors.ts` | `createCorsMiddleware()` returns an object with `handlePreflight(req)` and `appendCorsHeaders(response, req)`. Production default denies cross-origin browser requests unless `CORS_ALLOWED_ORIGINS` lists the origin. |
+
+## Routing convention
+
+Each route lives in its own subdirectory under `src/routes/`. The folder name becomes the URL segment after `/api/v1/`:
+
+```
+src/routes/home/home.ts   →  GET /api/v1/home
+src/routes/health/health.ts  →  GET /api/v1/health
+```
+
+Every route module exports a single async function:
+
+```typescript
+export async function handle(
+  req: Request,
+  server: Bun.Server<undefined>,
+  pathname?: string,
+): Promise<Response | null>;
+```
+
+Return `null` if the route does not match (wrong path or method). The pipeline in `routes.ts` tries each handler in order and uses the first non-null response.
+
+The order of operations inside a matching handler is always:
+1. Check path and method — return `null` if no match
+2. `await bodyLimit.checkBodySize(req, path)` — return 413 if too large
+3. `await rateLimit.consumeOr429(req, server)` — return 429 if over quota
+4. Handle the request and return `apiSuccess()` or `apiFailure()`
+
+This order ensures that body and rate-limit budgets are only charged when the route actually owns the request.
+
+## Adding a new route
+
+To add a `GET /api/v1/items` endpoint:
+
+1. Create `src/routes/items/items.ts`
+2. Export a `handle` function following the pattern above
+3. Import and append it to `handlers` in `src/routes/routes.ts`
+4. Add a `getMetricRouteLabel` branch for `"items"` in `routes.ts`
+
+<Tip>
+  Keep the folder name identical to the URL segment. The routing system has no automatic discovery — you register handlers manually in the `handlers` array in `routes.ts`.
+</Tip>
+
+## Environment variables
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `NODE_ENV` | — | Set to `production` to enable deny-by-default CORS. |
+| `LOG_LEVEL` | `info` | Logging verbosity: `debug`, `info`, `warn`, `error`, `success`. |
+| `MAX_BODY_BYTES` | `1048576` (1 MiB) | Default body size ceiling shared by routes that call `defaultMaxBodyBytes()`. |
+| `CORS_ALLOWED_ORIGINS` | — | Comma-separated browser origin allowlist. Required in production for cross-origin access. |
+| `TRUSTED_PROXY_RANGES` | — | Comma-separated IPv4 addresses or CIDRs of trusted reverse proxies. |
+| `TRUSTED_PROXY_IPS` | — | Exact-IP alternative to `TRUSTED_PROXY_RANGES`. Ignored when `TRUSTED_PROXY_RANGES` is set. |

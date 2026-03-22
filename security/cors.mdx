@@ -1,0 +1,157 @@
+---
+title: "CORS"
+description: "Configurable CORS middleware with preflight handling, origin allowlist, and deny-by-default in production."
+---
+
+bun-api-kit ships a CORS middleware in `src/utils/security/cors.ts`. It handles preflight (`OPTIONS`) requests and appends CORS headers to every non-preflight response. The middleware is instantiated once at server startup and shared across all routes.
+
+## Middleware instantiation
+
+```typescript
+// src/routes/routes.ts
+const cors = createCorsMiddleware();
+```
+
+Calling `createCorsMiddleware()` with no arguments uses the built-in defaults. You can pass a `CorsConfig` object to override any individual field.
+
+## `CorsConfig` type
+
+```typescript
+export type CorsConfig = {
+  origin?: string | string[] | ((origin: string) => boolean);
+  methods?: string[];
+  allowedHeaders?: string[];
+  exposedHeaders?: string[];
+  credentials?: boolean;
+  maxAge?: number;
+};
+```
+
+### Default values
+
+| Field | Default |
+|-------|---------|
+| `origin` | Derived from environment (see below) |
+| `methods` | `["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]` |
+| `allowedHeaders` | `["Content-Type", "Authorization", "X-Request-ID", "X-Trace-ID"]` |
+| `exposedHeaders` | `["X-Request-ID", "X-Trace-ID"]` |
+| `credentials` | `false` |
+| `maxAge` | `86400` (24 hours) |
+
+## Origin configuration
+
+The allowed origin is resolved once at startup by reading environment variables:
+
+```typescript
+function getDefaultOrigin(): string | string[] {
+  const configured = Bun.env.CORS_ALLOWED_ORIGINS
+    ?.split(",")
+    .map((o) => o.trim())
+    .filter((o) => o.length > 0);
+
+  if (configured && configured.length > 0) return configured;
+  if (Bun.env.NODE_ENV === "production") return [];   // deny all
+  return "*";                                          // allow all in dev
+}
+```
+
+### `CORS_ALLOWED_ORIGINS`
+
+Set this variable to a comma-separated list of allowed browser origins:
+
+```bash
+# .env.example
+CORS_ALLOWED_ORIGINS=https://api.example.com,https://app.example.com
+```
+
+Leading and trailing whitespace around each origin is stripped. An empty string after trimming is excluded.
+
+### Deny-by-default in production
+
+When `NODE_ENV=production` and `CORS_ALLOWED_ORIGINS` is not set, the resolved origin list is an empty array (`[]`). An empty array means no origin passes the `isOriginAllowed` check, so all cross-origin browser requests receive a **403** on preflight and no `Access-Control-Allow-Origin` header on regular responses.
+
+<Warning>
+  In production, cross-origin browser access is blocked by default. You must set `CORS_ALLOWED_ORIGINS` to enable it.
+</Warning>
+
+### Open in development
+
+When `NODE_ENV` is not `production` and `CORS_ALLOWED_ORIGINS` is unset, the origin resolves to `"*"`, permitting all browser origins. This avoids friction during local development.
+
+## `handlePreflight`
+
+The middleware's `handlePreflight` method handles true browser CORS preflight requests:
+
+```typescript
+handlePreflight(req: Request): Response | null
+```
+
+- Returns **`null`** if the request is not an `OPTIONS` request, has no `Origin` header, or has no `Access-Control-Request-Method` header.
+- Returns a **403** `Response` if the origin is not in the allowlist.
+- Returns a **204** `Response` with CORS headers if the preflight is valid.
+
+Preflight headers on a 204 response:
+
+| Header | Source |
+|--------|--------|
+| `Access-Control-Allow-Origin` | The request `Origin` value (exact match) |
+| `Access-Control-Allow-Methods` | Configured `methods` list |
+| `Access-Control-Allow-Headers` | The request's `Access-Control-Request-Headers` value |
+| `Access-Control-Expose-Headers` | Configured `exposedHeaders` list (when non-empty) |
+| `Access-Control-Max-Age` | Configured `maxAge` in seconds |
+| `Access-Control-Allow-Credentials` | `"true"` only when `credentials: true` is configured |
+
+Preflight is handled at the very start of the `handleRequest` pipeline, before route dispatch, body size checks, and rate limiting:
+
+```typescript
+// src/routes/routes.ts
+export async function handleRequest(
+  req: Request,
+  server: Bun.Server<undefined>,
+): Promise<Response> {
+  const preflight = cors.handlePreflight(req);
+  if (preflight) {
+    return finalize(preflight); // security headers are still applied
+  }
+  // ... rest of pipeline
+}
+```
+
+## `appendCorsHeaders`
+
+For all non-preflight responses, CORS headers are appended after the route handler returns:
+
+```typescript
+appendCorsHeaders(response: Response, req: Request): Response
+```
+
+- Returns the response unchanged if there is no `Origin` header on the request.
+- Returns the response unchanged if the origin is not in the allowlist.
+- Otherwise sets `Access-Control-Allow-Origin` to the exact request origin, and optionally `Access-Control-Allow-Credentials` and `Access-Control-Expose-Headers`.
+
+This is called inside `buildResponse` before `finalize`:
+
+```typescript
+// src/routes/routes.ts
+async function buildResponse(response, req, encoding) {
+  let finalResponse = cors.appendCorsHeaders(response, req);
+  finalResponse = finalize(finalResponse);
+  // ...
+}
+```
+
+## Credential support
+
+Credentials (`Access-Control-Allow-Credentials: true`) are **off by default**. To enable them, pass `credentials: true` when creating the middleware:
+
+```typescript
+const cors = createCorsMiddleware({ credentials: true });
+```
+
+<Note>
+  When `credentials` is `true`, the `Access-Control-Allow-Credentials: true` header is added to both preflight 204 responses and regular responses. Browsers require this for requests that include cookies or `Authorization` headers.
+</Note>
+
+<Warning>
+  Do not set `origin: "*"` together with `credentials: true`. Browsers will reject credentialed requests to a wildcard origin. Always specify an explicit origin list when enabling credentials.
+</Warning>

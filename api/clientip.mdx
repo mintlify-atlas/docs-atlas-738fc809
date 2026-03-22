@@ -1,0 +1,147 @@
+---
+title: "Client IP"
+description: "Trusted-proxy-aware client IP resolution for access logs and rate limiter keys."
+---
+
+`src/utils/clientip.ts` provides a single, consistent resolution strategy for determining the real client IP. The same logic is used in access logs and as the identity key for rate limiting, ensuring both systems always agree on who the client is.
+
+<Warning>
+  Forwarded headers (`X-Forwarded-For`, `X-Real-IP`) are only trusted when the **direct socket peer** matches a configured trusted proxy. Accepting these headers from untrusted peers allows clients to spoof their IP and bypass rate limiting.
+</Warning>
+
+## Resolution order
+
+<Steps>
+  <Step title="Read the direct socket peer">
+    `server.requestIP(req)` is called first to identify the immediate TCP peer — the machine that opened the connection to Bun. This value cannot be spoofed by the client.
+  </Step>
+  <Step title="Check trusted proxy list">
+    If the socket address matches `TRUSTED_PROXY_RANGES` or `TRUSTED_PROXY_IPS`, forwarded headers are considered trustworthy. If the peer is not trusted, the socket address is used directly as the client IP (reported as `(direct)`).
+  </Step>
+  <Step title="X-Forwarded-For (trusted peer only)">
+    If the peer is trusted, the first address in the `X-Forwarded-For` header is used when it is a valid IPv4 or IPv6 address. Reported as `(x-forwarded-for)`.
+  </Step>
+  <Step title="X-Real-IP (trusted peer only)">
+    If `X-Forwarded-For` is absent or invalid, `X-Real-IP` is tried. Reported as `(x-real-ip)`.
+  </Step>
+  <Step title="Fallback to socket address">
+    If neither forwarded header provides a valid address, the socket address is used. Reported as `(direct)`. If `server.requestIP` returned nothing, the address is `"unknown"`.
+  </Step>
+</Steps>
+
+## Environment variables
+
+| Variable | Purpose |
+|----------|---------|
+| `TRUSTED_PROXY_RANGES` | Comma-separated list of trusted proxy IPv4 addresses or CIDR ranges (e.g. `10.0.0.1,172.16.0.0/12`). Takes precedence over `TRUSTED_PROXY_IPS`. |
+| `TRUSTED_PROXY_IPS` | Backward-compatible alternative to `TRUSTED_PROXY_RANGES` for exact IP addresses only. Ignored when `TRUSTED_PROXY_RANGES` is set. |
+
+Both variables are parsed once at module load time. Invalid entries (malformed CIDRs, non-IP strings) are silently skipped.
+
+## Functions
+
+### `getClientIp`
+
+Resolves the client IP using the full trust-aware logic described above. Returns both the address string and the source that provided it.
+
+```typescript
+export function getClientIp(
+  req: Request,
+  server: Bun.Server<undefined>,
+): ClientIpResult
+```
+
+<ParamField path="req" type="Request" required>
+  The incoming Bun/Web `Request` object. `X-Forwarded-For` and `X-Real-IP` headers are read from here when the peer is trusted.
+</ParamField>
+
+<ParamField path="server" type="Bun.Server<undefined>" required>
+  The Bun server instance. `server.requestIP(req)` is called to obtain the socket address of the direct peer.
+</ParamField>
+
+**Returns:** `ClientIpResult` — see types below.
+
+```typescript
+const result = getClientIp(req, server);
+// result.address => "10.0.0.5"
+// result.source  => "forwarded"
+```
+
+---
+
+### `getClientIpKey`
+
+Returns the raw IP address string for use as a rate-limiter key. This is a thin wrapper around `getClientIp` that discards the `source` field.
+
+```typescript
+export function getClientIpKey(
+  req: Request,
+  server: Bun.Server<undefined>,
+): string
+```
+
+<ParamField path="req" type="Request" required>
+  The incoming request.
+</ParamField>
+
+<ParamField path="server" type="Bun.Server<undefined>" required>
+  The Bun server instance.
+</ParamField>
+
+**Returns:** The resolved IP address string (e.g. `"203.0.113.42"`), or `"unknown"` if the socket peer could not be determined.
+
+<Note>
+  `getClientIpKey` is used by `consumeOr429` in `src/utils/security/ratelimit.ts` as the per-client key for `RateLimiterMemory`. Using the same resolution logic here and in logs ensures the rate-limited identity matches what appears in access logs.
+</Note>
+
+---
+
+### `clientip`
+
+Convenience function for display and logging. Returns the IP address with the winning source annotated in parentheses.
+
+```typescript
+export function clientip(
+  req: Request,
+  server: Bun.Server<undefined>,
+): string
+```
+
+<ParamField path="req" type="Request" required>
+  The incoming request.
+</ParamField>
+
+<ParamField path="server" type="Bun.Server<undefined>" required>
+  The Bun server instance.
+</ParamField>
+
+**Returns:** A formatted string such as `"203.0.113.42 (x-forwarded-for)"`, `"10.0.0.1 (direct)"`, or `"unknown"`.
+
+| Source | Example output |
+|--------|----------------|
+| `forwarded` | `203.0.113.42 (x-forwarded-for)` |
+| `real-ip` | `203.0.113.42 (x-real-ip)` |
+| `socket` | `10.0.0.5 (direct)` |
+| `unknown` | `unknown` |
+
+This is what appears in the `client=` field of access logs:
+
+```
+[INFO] GET /api/v1/home client=203.0.113.42 (x-forwarded-for) traceId=3f2a... rid=550e...
+```
+
+## Types
+
+```typescript
+/** Supported sources for the client address used in logs and rate limiting. */
+export type ClientIpSource =
+  | "forwarded"   // from X-Forwarded-For via trusted peer
+  | "real-ip"     // from X-Real-IP via trusted peer
+  | "socket"      // from Bun server.requestIP (direct connection)
+  | "unknown";    // server.requestIP returned nothing
+
+export type ClientIpResult = {
+  address: string;
+  source: ClientIpSource;
+};
+```

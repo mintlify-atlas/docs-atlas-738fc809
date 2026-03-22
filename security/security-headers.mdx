@@ -1,0 +1,90 @@
+---
+title: "Security headers"
+description: "Baseline HTTP security headers applied to every response via mergeSecurityHeaders."
+---
+
+`mergeSecurityHeaders` in `src/utils/security/securityheaders.ts` adds a fixed set of security headers to every outbound response. It is called inside `finalize()` in `src/routes/routes.ts`, which means it runs on all responses — successful handler responses, 404s, 413s, 429s, and 500s.
+
+## Function signature
+
+```typescript
+// src/utils/security/securityheaders.ts
+export function mergeSecurityHeaders(response: Response): Response;
+```
+
+The function mutates the response's `Headers` object in place and returns the same `Response`.
+
+## Merge behavior
+
+Headers are added **only if not already present** on the response. Existing headers are never overwritten. This means a route handler can set its own `Cache-Control` value and it will not be replaced by the security header default.
+
+## Applied headers
+
+| Header | Value |
+|--------|-------|
+| `X-Content-Type-Options` | `nosniff` |
+| `X-Frame-Options` | `DENY` |
+| `Referrer-Policy` | `strict-origin-when-cross-origin` |
+| `Strict-Transport-Security` | `max-age=31536000; includeSubDomains` |
+| `Content-Security-Policy` | `default-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'` |
+| `X-XSS-Protection` | `0` |
+| `Permissions-Policy` | `accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()` |
+| `Cache-Control` | `no-store, no-cache, must-revalidate, private` |
+| `X-Download-Options` | `noopen` |
+| `X-Permitted-Cross-Domain-Policies` | `none` |
+
+## Header rationale
+
+**`X-Content-Type-Options: nosniff`**  
+Prevents browsers from MIME-sniffing a response away from its declared `Content-Type`.
+
+**`X-Frame-Options: DENY`**  
+Blocks the API responses from being embedded in `<iframe>`, `<frame>`, or `<object>` elements, preventing clickjacking.
+
+**`Referrer-Policy: strict-origin-when-cross-origin`**  
+Sends the full URL as referrer for same-origin requests; sends only the origin for cross-origin HTTPS requests; sends nothing for cross-origin HTTP requests. Limits referrer leakage.
+
+**`Strict-Transport-Security: max-age=31536000; includeSubDomains`**  
+Tells browsers to use HTTPS for this domain and all subdomains for one year. Only meaningful when the API is served over HTTPS.
+
+**`Content-Security-Policy`**  
+A strict default-deny policy appropriate for a JSON API: `default-src 'none'` blocks all resource loading, `base-uri 'self'` restricts `<base>` tags, `form-action 'self'` restricts form submission targets, and `frame-ancestors 'none'` mirrors the `X-Frame-Options` restriction.
+
+**`X-XSS-Protection: 0`**  
+Disables the legacy browser XSS filter. Modern guidance recommends disabling it because the filter itself introduced vulnerabilities in some browsers. The CSP above provides the meaningful protection.
+
+**`Permissions-Policy`**  
+Disables access to hardware APIs that a JSON API server has no reason to expose: accelerometer, camera, geolocation, gyroscope, magnetometer, microphone, payment, and USB.
+
+**`Cache-Control: no-store, no-cache, must-revalidate, private`**  
+Prevents sensitive API response data from being cached by browsers, proxies, or CDN edge nodes.
+
+**`X-Download-Options: noopen`**  
+Prevents Internet Explorer from opening downloaded files directly in the browser context, reducing the risk of content injection via downloaded responses.
+
+**`X-Permitted-Cross-Domain-Policies: none`**  
+Blocks Adobe Flash and Acrobat from loading content from this domain via cross-domain policy files.
+
+## Where `finalize` is called
+
+`finalize` is an internal function in `src/routes/routes.ts` that applies `mergeSecurityHeaders`, mirrors the `X-Request-ID` header, and sets `X-Trace-ID`:
+
+```typescript
+// src/routes/routes.ts
+function finalize(response: Response): Response {
+  const traceId = getTraceId();
+  if (traceId) {
+    response.headers.set("X-Trace-ID", traceId);
+  }
+  return mergeSecurityHeaders(mirrorRequestIdHeader(response));
+}
+```
+
+It is called in two places:
+
+1. **CORS preflight responses** — `finalize(cors.handlePreflight(req))` — so OPTIONS responses also carry the security headers.
+2. **All handler and fallback responses** — through `buildResponse`, which calls `finalize` on every matched route response, every `respondNotFound` response, and every 500 error response.
+
+<Tip>
+  Because `mergeSecurityHeaders` never overwrites existing headers, you can set a custom `Cache-Control` in a specific route response and it will take precedence over the default `no-store` value.
+</Tip>

@@ -1,0 +1,264 @@
+---
+title: "Validation"
+description: "Zod-based helpers for validating request bodies, query strings, and route params with a uniform result type."
+---
+
+The validation module wraps Zod's `safeParse` into three typed helpers and exposes a set of pre-built schemas for common use cases. All three helpers return a `ValidationResult<T>` — a discriminated union that makes it easy to branch on success or failure and return a structured 400 response.
+
+## `ValidationResult<T>`
+
+```typescript
+export type ValidationResult<T> =
+  | { success: true; data: T }
+  | { success: false; error: string; issues?: z.ZodIssue[] };
+```
+
+<ResponseField name="success" type="boolean" required>
+  `true` when the input passed the schema, `false` when it failed.
+</ResponseField>
+
+<ResponseField name="data" type="T">
+  Present only when `success` is `true`. The parsed and typed output from Zod — defaults and coercions are applied.
+</ResponseField>
+
+<ResponseField name="error" type="string">
+  Present only when `success` is `false`. A semicolon-separated human-readable summary of all issues, formatted as `path: message; path: message`.
+</ResponseField>
+
+<ResponseField name="issues" type="z.ZodIssue[]">
+  Present only when `success` is `false`. The raw Zod issue array for programmatic inspection.
+</ResponseField>
+
+---
+
+## `validateBody`
+
+Validate an already-parsed request body against a Zod schema.
+
+```typescript
+import { validateBody } from "../../utils/validation.ts";
+
+export function validateBody<T extends z.ZodTypeAny>(
+  schema: T,
+  body: unknown,
+): ValidationResult<z.infer<T>>
+```
+
+<ParamField path="schema" type="T extends z.ZodTypeAny" required>
+  Any Zod schema. The helper calls `schema.safeParse(body)` internally.
+</ParamField>
+
+<ParamField path="body" type="unknown" required>
+  The parsed request body. Parse it from JSON before calling this function (e.g., `await req.json()`).
+</ParamField>
+
+#### Example
+
+```typescript
+import { z } from "zod";
+import { validateBody } from "../../utils/validation.ts";
+import { apiFailure, apiSuccess } from "../../utils/response.ts";
+
+const CreateUserSchema = z.object({
+  email: z.string().email(),
+  name: z.string().min(1),
+});
+
+const body = await req.json();
+const result = validateBody(CreateUserSchema, body);
+
+if (!result.success) {
+  return apiFailure({ message: result.error }, { status: 400 });
+}
+
+// result.data is typed as { email: string; name: string }
+console.log(result.data.email);
+```
+
+---
+
+## `validateQuery`
+
+Validate URL query parameters against a Zod schema. Missing query keys are normalized to empty strings before parsing so Zod `default()` and `optional()` work as expected.
+
+```typescript
+import { validateQuery } from "../../utils/validation.ts";
+
+export function validateQuery<T extends z.ZodTypeAny>(
+  schema: T,
+  query: Record<string, string | undefined>,
+): ValidationResult<z.infer<T>>
+```
+
+<ParamField path="schema" type="T extends z.ZodTypeAny" required>
+  A Zod schema describing the expected query parameters. Use `z.coerce.number()` for numeric values since all query params arrive as strings.
+</ParamField>
+
+<ParamField path="query" type="Record<string, string | undefined>" required>
+  The query parameter map. Typically built from `Object.fromEntries(new URL(req.url).searchParams)`.
+</ParamField>
+
+<Note>
+  Before calling `schema.safeParse`, `validateQuery` maps every `undefined` value to `""`. This means a missing `?page=` becomes `""` rather than `undefined` — schemas using `z.coerce.number().default(1)` will coerce the empty string to `NaN` which fails validation, allowing you to distinguish "not provided" from a valid default. Use `z.coerce.number().default(1)` (as in `schemas.pagination`) to apply the default after coercion.
+</Note>
+
+#### Example
+
+```typescript
+import { validateQuery, schemas } from "../../utils/validation.ts";
+
+const url = new URL(req.url);
+const query = Object.fromEntries(url.searchParams);
+const result = validateQuery(schemas.pagination, query);
+
+if (!result.success) {
+  return apiFailure({ message: result.error }, { status: 400 });
+}
+
+// result.data is typed as { page: number; limit: number }
+// defaults applied: page=1, limit=20 when params are absent
+const { page, limit } = result.data;
+```
+
+---
+
+## `validateParams`
+
+Validate route parameters extracted from the URL path.
+
+```typescript
+import { validateParams } from "../../utils/validation.ts";
+
+export function validateParams<T extends z.ZodTypeAny>(
+  schema: T,
+  params: Record<string, string>,
+): ValidationResult<z.infer<T>>
+```
+
+<ParamField path="schema" type="T extends z.ZodTypeAny" required>
+  A Zod schema for the param map. All values are strings since they come from URL segments.
+</ParamField>
+
+<ParamField path="params" type="Record<string, string>" required>
+  The extracted route parameter map, e.g. `{ id: "user_123" }` for a path like `/api/v1/users/user_123`.
+</ParamField>
+
+#### Example
+
+```typescript
+import { validateParams, schemas } from "../../utils/validation.ts";
+
+// pathname = "/api/v1/users/user_123"
+const id = pathname.split("/").at(-1) ?? "";
+const result = validateParams(schemas.id, { id });
+
+if (!result.success) {
+  return apiFailure({ message: result.error }, { status: 400 });
+}
+
+// result.data.id is a non-empty string
+console.log(result.data.id);
+```
+
+---
+
+## Pre-built schemas
+
+Three reusable schemas are exported from `validation.ts` under the `schemas` object.
+
+### `schemas.pagination`
+
+For paginated list endpoints accepting `?page=` and `?limit=` query parameters.
+
+```typescript
+schemas.pagination = z.object({
+  page: z.coerce.number().int().min(1).default(1),
+  limit: z.coerce.number().int().min(1).max(100).default(20),
+});
+```
+
+| Field | Type | Constraints | Default |
+|-------|------|-------------|----------|
+| `page` | `number` | Integer, min 1 | `1` |
+| `limit` | `number` | Integer, min 1, max 100 | `20` |
+
+### `schemas.id`
+
+For route params or bodies that carry a single string identifier.
+
+```typescript
+schemas.id = z.object({
+  id: z.string().min(1),
+});
+```
+
+| Field | Type | Constraints |
+|-------|------|-------------|
+| `id` | `string` | Minimum 1 character |
+
+### `schemas.email`
+
+For bodies or query strings carrying an email address.
+
+```typescript
+schemas.email = z.object({
+  email: z.string().email(),
+});
+```
+
+| Field | Type | Constraints |
+|-------|------|-------------|
+| `email` | `string` | Must pass Zod's email format check |
+
+---
+
+## Complete usage example
+
+```typescript
+import { z } from "zod";
+import { validateBody, validateQuery, schemas } from "../../utils/validation.ts";
+import { apiSuccess, apiFailure } from "../../utils/response.ts";
+import { log } from "../../utils/logger.ts";
+
+const BodySchema = z.object({
+  title: z.string().min(1).max(200),
+  published: z.boolean().default(false),
+});
+
+export async function handle(
+  req: Request,
+  server: Bun.Server<undefined>,
+  pathname?: string,
+): Promise<Response | null> {
+  if (req.method !== "POST" || pathname !== "/api/v1/posts") {
+    return null;
+  }
+
+  // Validate query params
+  const url = new URL(req.url);
+  const queryResult = validateQuery(schemas.pagination, Object.fromEntries(url.searchParams));
+  if (!queryResult.success) {
+    return apiFailure({ message: queryResult.error }, { status: 400 });
+  }
+
+  // Validate body
+  let rawBody: unknown;
+  try {
+    rawBody = await req.json();
+  } catch {
+    return apiFailure({ message: "Invalid JSON body" }, { status: 400 });
+  }
+
+  const bodyResult = validateBody(BodySchema, rawBody);
+  if (!bodyResult.success) {
+    log("warn", "Invalid request body", { issues: bodyResult.error });
+    return apiFailure({ message: bodyResult.error }, { status: 400 });
+  }
+
+  const { title, published } = bodyResult.data;
+  // ... create the post ...
+
+  log("success", "Post created", { title });
+  return apiSuccess({ title, published }, { status: 201 });
+}
+```

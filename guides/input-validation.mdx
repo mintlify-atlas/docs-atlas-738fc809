@@ -1,0 +1,165 @@
+---
+title: "Input validation"
+description: "Use the built-in Zod helpers to validate request bodies, query strings, and route params."
+---
+
+bun-api-kit ships three validation helpers in `src/utils/validation.ts`, all backed by [Zod](https://zod.dev). They share a single return type and a consistent error format so you can handle failures the same way everywhere.
+
+## ValidationResult\<T\>
+
+Every helper returns `ValidationResult<T>`:
+
+```typescript
+type ValidationResult<T> =
+  | { success: true; data: T }
+  | { success: false; error: string; issues?: z.ZodIssue[] };
+```
+
+When `success` is `false`, `error` is a human-readable string of all validation failures joined by `"; "`, formatted as `field.path: message`. The raw `issues` array from Zod is also available if you need to inspect individual failures.
+
+## The three helpers
+
+### validateBody
+
+Validates an already-parsed request body (the result of `req.json()`) against a Zod schema.
+
+```typescript
+function validateBody<T extends z.ZodTypeAny>(
+  schema: T,
+  body: unknown,
+): ValidationResult<z.infer<T>>
+```
+
+### validateQuery
+
+Validates query parameters. Missing values are normalized to `""` before parsing, which lets Zod's `.default()` and `.optional()` work as expected on query strings.
+
+```typescript
+function validateQuery<T extends z.ZodTypeAny>(
+  schema: T,
+  query: Record<string, string | undefined>,
+): ValidationResult<z.infer<T>>
+```
+
+### validateParams
+
+Validates route params that have already been extracted into a `Record<string, string>` map.
+
+```typescript
+function validateParams<T extends z.ZodTypeAny>(
+  schema: T,
+  params: Record<string, string>,
+): ValidationResult<z.infer<T>>
+```
+
+## Pre-built schemas
+
+Three common schemas are exported from `validation.ts` under the `schemas` object. Use them directly or compose them into larger schemas.
+
+```typescript
+export const schemas = {
+  // Coerces "page" and "limit" strings to integers; applies min/max/default
+  pagination: z.object({
+    page: z.coerce.number().int().min(1).default(1),
+    limit: z.coerce.number().int().min(1).max(100).default(20),
+  }),
+
+  // Ensures "id" is a non-empty string
+  id: z.object({
+    id: z.string().min(1),
+  }),
+
+  // Validates "email" format
+  email: z.object({
+    email: z.string().email(),
+  }),
+};
+```
+
+## Validating a request body
+
+```typescript
+import { validateBody, apiFailure } from "../../utils/validation.ts";
+import { apiFailure } from "../../utils/response.ts";
+import { log } from "../../utils/logger.ts";
+import { z } from "zod";
+
+const createUserSchema = z.object({
+  name: z.string().min(1).max(128),
+  email: z.string().email(),
+  role: z.enum(["admin", "member"]).default("member"),
+});
+
+// Inside your handle function, after path/method/bodySize/rateLimit checks:
+let body: unknown;
+try {
+  body = await req.json();
+} catch {
+  return apiFailure({ message: "Invalid JSON body." }, { status: 400 });
+}
+
+const parsed = validateBody(createUserSchema, body);
+if (!parsed.success) {
+  log("warn", `POST ${path} validation failed: ${parsed.error}`);
+  return apiFailure({ message: parsed.error }, { status: 400 });
+}
+
+// parsed.data is fully typed as { name: string; email: string; role: "admin" | "member" }
+const { name, email, role } = parsed.data;
+```
+
+## Validating query parameters
+
+```typescript
+import { validateQuery, schemas } from "../../utils/validation.ts";
+import { apiFailure } from "../../utils/response.ts";
+import { log } from "../../utils/logger.ts";
+
+// Inside your handle function:
+const url = new URL(req.url);
+const rawQuery = Object.fromEntries(url.searchParams.entries());
+
+const parsed = validateQuery(schemas.pagination, rawQuery);
+if (!parsed.success) {
+  log("warn", `GET ${path} invalid query: ${parsed.error}`);
+  return apiFailure({ message: parsed.error }, { status: 400 });
+}
+
+// parsed.data.page and parsed.data.limit are typed numbers with defaults applied
+const { page, limit } = parsed.data;
+```
+
+## Returning a 400 on failure
+
+All three helpers use the same failure pattern: check `parsed.success`, log a warning with the error string, then return `apiFailure` with the message and HTTP 400.
+
+```typescript
+if (!parsed.success) {
+  log("warn", `${req.method} ${path} validation failed: ${parsed.error}`);
+  return apiFailure({ message: parsed.error }, { status: 400 });
+}
+```
+
+The response body will be:
+
+```json
+{
+  "success": false,
+  "data": {
+    "message": "name: String must contain at least 1 character(s); email: Invalid email"
+  }
+}
+```
+
+<Tip>
+  Create custom Zod schemas at module level (outside the handler function) so they are compiled once and reused across requests. Import `z` from the `zod` package which is already a dependency in `package.json`.
+
+  ```typescript
+  import { z } from "zod";
+
+  const mySchema = z.object({
+    page: z.coerce.number().int().min(1).default(1),
+    status: z.enum(["active", "inactive"]).optional(),
+  });
+  ```
+</Tip>

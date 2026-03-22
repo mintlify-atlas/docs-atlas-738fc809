@@ -1,0 +1,149 @@
+---
+title: "Deployment"
+description: "How to run bun-api-kit in production, configure environment variables, and set up health checks."
+---
+
+bun-api-kit is a plain `Bun.serve` HTTP server. There is no build step — deploy the source directly and run it with Bun.
+
+## Starting the server
+
+<CodeGroup>
+
+```bash Development (hot reload)
+bun run start
+```
+
+```bash Production (direct)
+bun index.ts
+```
+
+</CodeGroup>
+
+`bun run start` runs `bun --watch index.ts`, which reloads the process on every file change. The server always listens on port **3000**.
+
+<Note>
+  `bun --watch` (hot reload) is convenient during development but is not recommended for production. In production, run `bun index.ts` directly and let your process supervisor (systemd, Docker, Kubernetes) handle restarts.
+</Note>
+
+## Environment variable setup
+
+Set production variables via your platform's secrets management or a `.env` file on the server. The minimum recommended configuration for production:
+
+```bash
+NODE_ENV=production
+LOG_LEVEL=info
+MAX_BODY_BYTES=1048576
+CORS_ALLOWED_ORIGINS=https://your-frontend.example.com
+TRUSTED_PROXY_RANGES=127.0.0.1/32,10.0.0.0/8
+```
+
+See [Environment variables](/guides/environment-variables) for the full reference.
+
+## Key production settings
+
+<ParamField query="NODE_ENV" type="string">
+  Set to `production` to enable production-mode security defaults. The most significant effect is that CORS switches to deny-by-default for cross-origin browser requests unless `CORS_ALLOWED_ORIGINS` is configured.
+</ParamField>
+
+<ParamField query="CORS_ALLOWED_ORIGINS" type="string">
+  Required for any browser client to access the API in production. Provide a comma-separated list of allowed origins. Omitting this variable means all cross-origin browser requests are rejected when `NODE_ENV=production`.
+
+  ```bash
+  CORS_ALLOWED_ORIGINS=https://app.example.com,https://admin.example.com
+  ```
+</ParamField>
+
+<ParamField query="TRUSTED_PROXY_RANGES" type="string">
+  Set this when the server runs behind a load balancer or reverse proxy (nginx, Envoy, AWS ALB, etc.). Without it, `X-Forwarded-For` is ignored and all clients appear to come from the proxy's IP — breaking rate limiting and access logs.
+
+  Use the CIDR range of your proxy tier:
+
+  ```bash
+  # Loopback + private 10.x range (common for cloud load balancers)
+  TRUSTED_PROXY_RANGES=127.0.0.1/32,10.0.0.0/8
+  ```
+</ParamField>
+
+<ParamField query="LOG_LEVEL" type="string" default="info">
+  `info` is a reasonable production default. Use `warn` or `error` to reduce log volume on high-traffic deployments. Avoid `debug` in production as it emits verbose output.
+</ParamField>
+
+<ParamField query="MAX_BODY_BYTES" type="number" default="1048576">
+  Tune to match your workload. The default 1 MiB is appropriate for JSON APIs. Increase for routes that accept file uploads; individual routes can also override the global default with a literal value in `createRouteBodyLimit`.
+</ParamField>
+
+## Health check endpoint
+
+A health check endpoint is available at `GET /api/v1/health`. It returns HTTP 200 with a small readiness payload:
+
+```json
+{
+  "success": true,
+  "data": {
+    "status": "healthy",
+    "timestamp": "2026-03-22T10:00:00.000Z"
+  }
+}
+```
+
+Use this endpoint for Kubernetes liveness and readiness probes:
+
+```yaml
+livenessProbe:
+  httpGet:
+    path: /api/v1/health
+    port: 3000
+  initialDelaySeconds: 5
+  periodSeconds: 10
+
+readinessProbe:
+  httpGet:
+    path: /api/v1/health
+    port: 3000
+  initialDelaySeconds: 5
+  periodSeconds: 10
+```
+
+The endpoint is rate-limited to 100 requests per 60 seconds per IP to prevent scraping, while still allowing normal probe frequencies.
+
+## Security headers
+
+Every response — including error responses and 404s — automatically includes a full set of security headers applied by `mergeSecurityHeaders` in the request pipeline:
+
+| Header | Value |
+|--------|-------|
+| `Strict-Transport-Security` | `max-age=31536000; includeSubDomains` |
+| `X-Frame-Options` | `DENY` |
+| `X-Content-Type-Options` | `nosniff` |
+| `Referrer-Policy` | `strict-origin-when-cross-origin` |
+| `X-XSS-Protection` | `0` |
+| `Cache-Control` | `no-store, no-cache, must-revalidate, private` |
+| `X-Permitted-Cross-Domain-Policies` | `none` |
+
+HSTS (`Strict-Transport-Security`) is included by default. Ensure your deployment terminates TLS before traffic reaches the server so the header is meaningful to browsers.
+
+## Docker example
+
+```dockerfile
+FROM oven/bun:1 AS base
+WORKDIR /app
+
+COPY package.json bun.lock* ./
+RUN bun install --frozen-lockfile
+
+COPY . .
+
+EXPOSE 3000
+CMD ["bun", "index.ts"]
+```
+
+Pass environment variables at runtime:
+
+```bash
+docker run \
+  -e NODE_ENV=production \
+  -e CORS_ALLOWED_ORIGINS=https://app.example.com \
+  -e TRUSTED_PROXY_RANGES=10.0.0.0/8 \
+  -p 3000:3000 \
+  your-image
+```

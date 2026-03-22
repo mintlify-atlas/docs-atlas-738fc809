@@ -1,0 +1,207 @@
+---
+title: "Metrics"
+description: "In-memory counters, histograms, and gauges for HTTP requests, errors, latency, rate limits, and active connections."
+---
+
+`src/utils/metrics.ts` provides a lightweight in-memory metrics registry. All instrumentation is performed in `routes.ts` around the request pipeline. Route labels are **always bounded** — raw request paths are never recorded as metric labels.
+
+<Warning>
+  These metrics are held entirely in process memory. They are not persisted across restarts and are not thread-safe across multiple Bun workers. They are suitable for single-process deployments, health dashboards, and development-time inspection.
+</Warning>
+
+## Metric handles
+
+The exported `metrics` object provides direct handles to all instrumented metrics:
+
+```typescript
+export const metrics = {
+  requests: {
+    total: Counter,       // http_requests_total
+    duration: Histogram,  // http_request_duration_ms
+    errors: Counter,      // http_errors_total
+    active: Gauge,        // active_requests
+  },
+  rateLimit: {
+    hits: Counter,        // rate_limit_hits_total
+  },
+};
+```
+
+### `metrics.requests.total`
+
+Counter. Incremented once per request, just before the handler loop runs.
+
+```typescript
+metrics.requests.total.increment({ method: req.method, route: routeLabel });
+```
+
+### `metrics.requests.duration`
+
+Histogram. Records latency in milliseconds from just before the handler loop to just after a response is ready.
+
+```typescript
+metrics.requests.duration.observe(latency, { method: req.method, route: routeLabel });
+```
+
+### `metrics.requests.errors`
+
+Counter. Incremented only when an unhandled exception escapes the route try/catch in `routes.ts`.
+
+```typescript
+metrics.requests.errors.increment({ method: req.method, route: routeLabel });
+```
+
+### `metrics.requests.active`
+
+Gauge. Tracks the number of requests currently in-flight. Incremented at the start of each request and decremented when a response is returned or an error is caught.
+
+```typescript
+metrics.requests.active.increment();
+// ... handle request ...
+metrics.requests.active.decrement();
+```
+
+### `metrics.rateLimit.hits`
+
+Counter. Incremented by `consumeOr429` in `src/utils/security/ratelimit.ts` each time a request is rejected with HTTP 429.
+
+```typescript
+metrics.rateLimit.hits.increment();
+```
+
+## Bounded route labels
+
+All metric calls in `routes.ts` use `getMetricRouteLabel(pathname)` to convert the raw URL path into one of four known values. This prevents unbounded label cardinality caused by attacker-controlled or dynamic paths.
+
+```typescript
+function getMetricRouteLabel(pathname: string): string {
+  if (pathname === `${PREFIX}/health`) {
+    return "health";
+  }
+  if (pathname === `${PREFIX}/home`) {
+    return "home";
+  }
+  if (pathname.startsWith(PREFIX)) {
+    return "not_found";
+  }
+  return "outside_prefix";
+}
+```
+
+| Label | Meaning |
+|-------|---------|
+| `health` | `GET /api/v1/health` |
+| `home` | `GET /api/v1/home` |
+| `not_found` | Any path under `/api/v1` that matched no handler |
+| `outside_prefix` | Requests outside `/api/v1` entirely |
+
+<Note>
+  When you add a new route, add a corresponding `if` branch to `getMetricRouteLabel` in `routes.ts` so it gets its own label instead of being counted as `not_found`.
+</Note>
+
+## `getMetricsSnapshot`
+
+Exports the entire in-memory registry as a plain JSON-serializable object. This is the primary way to read all current metric values.
+
+```typescript
+export function getMetricsSnapshot(): Record<string, unknown>
+```
+
+**Returns:** A snapshot of all registered counters, histograms, and gauges.
+
+### Return shape
+
+Labels are serialized as `key=value` pairs joined by `;` and used as property keys on each metric object. The global (no-label) bucket is stored under the key `_global_`.
+
+<ResponseField name="http_requests_total" type="object">
+  Counter values keyed by label string.
+  <Expandable title="properties">
+    <ResponseField name="method=GET;route=home" type="number">
+      Number of GET requests to the `home` route.
+    </ResponseField>
+    <ResponseField name="method=GET;route=health" type="number">
+      Number of GET requests to the `health` route.
+    </ResponseField>
+    <ResponseField name="method=GET;route=not_found" type="number">
+      Requests to unknown paths under the API prefix.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="http_request_duration_ms" type="object">
+  Histogram statistics keyed by label string.
+  <Expandable title="properties">
+    <ResponseField name="[label]" type="object">
+      Per-label histogram bucket.
+      <Expandable title="properties">
+        <ResponseField name="count" type="number">Number of observations in this bucket.</ResponseField>
+        <ResponseField name="min" type="number">Minimum observed latency in milliseconds.</ResponseField>
+        <ResponseField name="max" type="number">Maximum observed latency in milliseconds.</ResponseField>
+        <ResponseField name="avg" type="number">Mean latency in milliseconds.</ResponseField>
+      </Expandable>
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="http_errors_total" type="object">
+  Counter values for unhandled exceptions, keyed by label string.
+</ResponseField>
+
+<ResponseField name="active_requests" type="object">
+  Current in-flight request count, keyed by label string. The gauge floor is `0` — it never goes negative.
+</ResponseField>
+
+<ResponseField name="rate_limit_hits_total" type="object">
+  Counter of rate-limited (HTTP 429) responses. Uses the `_global_` key when incremented without labels.
+</ResponseField>
+
+### Example snapshot
+
+```json
+{
+  "http_requests_total": {
+    "method=GET;route=health": 42,
+    "method=GET;route=home": 17
+  },
+  "http_request_duration_ms": {
+    "method=GET;route=health": {
+      "count": 42,
+      "min": 0.41,
+      "max": 12.3,
+      "avg": 1.07
+    }
+  },
+  "http_errors_total": {},
+  "active_requests": {
+    "_global_": 1
+  },
+  "rate_limit_hits_total": {
+    "_global_": 3
+  }
+}
+```
+
+## Interfaces
+
+```typescript
+/** String labels attached to counters, gauges, and histograms. */
+type MetricLabels = Record<string, string>;
+
+/** Minimal counter contract used by the in-memory registry. */
+interface Counter {
+  increment(labels?: MetricLabels): void;
+  value(labels?: MetricLabels): number;
+}
+
+/** Minimal histogram contract used by the in-memory registry. */
+interface Histogram {
+  observe(value: number, labels?: MetricLabels): void;
+}
+
+/** Minimal gauge contract used by the in-memory registry. */
+interface Gauge {
+  increment(labels?: MetricLabels): void;
+  decrement(labels?: MetricLabels): void;
+  value(labels?: MetricLabels): number;
+}
+```

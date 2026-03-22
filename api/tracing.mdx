@@ -1,0 +1,141 @@
+---
+title: "Tracing"
+description: "Per-request trace and span IDs stored in AsyncLocalStorage and surfaced on responses as X-Trace-ID."
+---
+
+Every request handled by `handleRequest` is wrapped inside `runWithTrace`. This generates a fresh trace ID and span ID for the request's async execution chain. The trace ID appears in access logs, unhandled-error logs, and the final response header `X-Trace-ID` so client-visible failures can be correlated with server-side records.
+
+## ID formats
+
+| ID | Source | Format |
+|----|--------|--------|
+| `traceId` | `randomBytes(16).toString("hex")` | 32-character lowercase hex string (128-bit) |
+| `spanId` | `randomBytes(8).toString("hex")` | 16-character lowercase hex string (64-bit) |
+
+Both are generated fresh per request using `randomBytes` from `node:crypto`.
+
+## Functions
+
+### `runWithTrace`
+
+Starts a fresh trace scope for one request lifecycle. Generates a `traceId` (32 hex chars) and a `spanId` (16 hex chars), stores them in `AsyncLocalStorage`, and invokes `fn` with the `traceId` as its argument.
+
+```typescript
+export function runWithTrace<T>(
+  fn: (traceId: string) => Promise<T>,
+): Promise<T>
+```
+
+<ParamField path="fn" type="(traceId: string) => Promise<T>" required>
+  An async callback that runs inside the trace scope. The resolved `traceId` is passed as the first argument. Any code that calls `getTraceId()`, `getSpanId()`, or `getTraceHeaders()` from within this callback will see the generated values.
+</ParamField>
+
+**Returns:** `Promise<T>` — the value resolved by `fn`.
+
+```typescript
+// In routes.ts — nested inside runWithRequestContext:
+return runWithRequestContext(req, () =>
+  runWithTrace(async () => {
+    const traceHeaders = getTraceHeaders();
+    log("info", `${req.method} ${pathname}`, { traceId: traceHeaders["X-Trace-ID"] });
+    // ...
+  }),
+);
+```
+
+---
+
+### `getTraceId`
+
+Reads the trace ID from the active `AsyncLocalStorage` context. Returns `undefined` when called outside a `runWithTrace` scope.
+
+```typescript
+export function getTraceId(): string | undefined
+```
+
+**Returns:** The 32-character hex trace ID string, or `undefined` if no trace context is active.
+
+---
+
+### `getSpanId`
+
+Reads the span ID from the active `AsyncLocalStorage` context. Returns `undefined` when called outside a `runWithTrace` scope.
+
+```typescript
+export function getSpanId(): string | undefined
+```
+
+**Returns:** The 16-character hex span ID string, or `undefined` if no trace context is active.
+
+---
+
+### `getTraceHeaders`
+
+Returns an object containing trace headers suitable for attaching to outgoing responses or forwarding to upstream services. When called outside a trace scope the returned object is empty.
+
+```typescript
+export function getTraceHeaders(): Record<string, string>
+```
+
+**Returns:** `{ "X-Trace-ID": string }` when a trace context is active, or `{}` when there is no active context.
+
+```typescript
+// Typical usage in routes.ts:
+const traceHeaders = getTraceHeaders();
+log("info", `${req.method} ${pathname}`, { traceId: traceHeaders["X-Trace-ID"] });
+```
+
+---
+
+### `createChildSpan`
+
+Generates a child span ID derived from the current span. If no trace scope is active, a standalone random span ID is returned instead.
+
+```typescript
+export function createChildSpan(): string
+```
+
+**Returns:** A string combining a component of the current span ID with a new random 16-char hex segment, or a fresh standalone span ID if no context is active.
+
+## How `X-Trace-ID` reaches the response
+
+The `finalize()` function in `routes.ts` calls `getTraceId()` and sets the `X-Trace-ID` header on every response before it leaves the server. This runs for successful handler responses, not-found responses, and internal error responses.
+
+```typescript
+// src/routes/routes.ts
+function finalize(response: Response): Response {
+  const traceId = getTraceId();
+  if (traceId) {
+    response.headers.set("X-Trace-ID", traceId);
+  }
+  return mergeSecurityHeaders(mirrorRequestIdHeader(response));
+}
+```
+
+## Access log format
+
+Each incoming request is logged at `info` level with both the trace ID and the request ID:
+
+```
+[INFO] GET /api/v1/home client=10.0.0.5 (direct) traceId=3f2a1b0c... rid=550e8400-...
+```
+
+Unhandled errors are also logged with the trace ID so the server-side stack trace can be linked to the `X-Trace-ID` value seen by the caller:
+
+```typescript
+log(
+  "error",
+  `Unhandled error processing ${req.method} ${pathname}: ${error.message}`,
+  { traceId: traceHeaders["X-Trace-ID"] },
+);
+```
+
+## Types
+
+```typescript
+/** Async-local trace payload used by logging and response finalization. */
+type TraceStore = {
+  traceId: string;
+  spanId: string;
+};
+```

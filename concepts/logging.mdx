@@ -1,0 +1,169 @@
+---
+title: "Logging"
+description: "The log() helper, available levels, output format, and request-scoped rid injection in bun-api-kit."
+---
+
+bun-api-kit uses a single logging helper defined in `src/utils/logger.ts`. All route modules and the server entry point (`index.ts`) use this helper — raw `console.log` calls are not used in the codebase.
+
+## Import and call
+
+```typescript
+import { log } from "../../utils/logger.ts";
+
+log("info", "message");
+log("success", "GET /api/v1/home");
+log("error", "Something broke", { requestId: "abc" });
+```
+
+There is also a method-style convenience object for modules that prefer it:
+
+```typescript
+import { logger } from "../../utils/logger.ts";
+
+logger.info("message");
+logger.error("Something broke", { requestId: "abc" });
+```
+
+## Signature
+
+```typescript
+export function log(
+  level: "debug" | "info" | "warn" | "error" | "success",
+  message: string,
+  ctx?: { rid?: string; traceId?: string; [key: string]: unknown },
+): void
+```
+
+`ctx` is an optional object of arbitrary key-value pairs appended to the log line.
+
+## Levels
+
+| Level | ANSI color | Numeric priority | `console` stream |
+|-------|-----------|------------------|------------------|
+| `debug` | gray (`\x1b[90m`) | 0 | `console.log` |
+| `info` | cyan (`\x1b[36m`) | 1 | `console.log` |
+| `warn` | yellow (`\x1b[33m`) | 2 | `console.warn` |
+| `error` | red (`\x1b[31m`) | 3 | `console.error` |
+| `success` | green (`\x1b[32m`) | 4 | `console.log` |
+
+Colors come from `LOG_COLORS` in `src/routes/constants.ts`:
+
+```typescript
+export const LOG_COLORS = {
+  debug: "\x1b[90m",
+  success: "\x1b[32m",
+  error: "\x1b[31m",
+  warn: "\x1b[33m",
+  info: "\x1b[36m",
+} as const;
+
+export const LOG_RESET = "\x1b[0m";
+```
+
+## Output format
+
+Each log line is a single line in the form:
+
+```
+[LEVEL] message key1=value1 key2=value2
+```
+
+The `[LEVEL]` label is wrapped in the matching ANSI color code and then reset. Control characters (`\r`, `\n`, `\t`) and existing ANSI codes in the message and context values are stripped to keep logs single-line and terminal-safe.
+
+### Example — server startup
+
+```
+[INFO] Listening on http://localhost:3000
+```
+
+### Example — access log
+
+The pipeline in `routes.ts` writes one `info` line per non-preflight request:
+
+```typescript
+log(
+  "info",
+  `${req.method} ${pathname} client=${clientip(req, server)}`,
+  { traceId: traceHeaders["X-Trace-ID"] },
+);
+```
+
+Rendered output (with request context active):
+
+```
+[INFO] GET /api/v1/home client=127.0.0.1 rid=018e4f2a-1234-7abc-9def-000000000001 traceId=abc123...
+```
+
+### Example — route success
+
+```typescript
+log("success", `GET ${path}`);
+```
+
+```
+[SUCCESS] GET /api/v1/home rid=018e4f2a-1234-7abc-9def-000000000001
+```
+
+### Example — not-found warning
+
+```typescript
+log("warn", `No handler for ${req.method} ${path}`);
+```
+
+```
+[WARN] No handler for GET /api/v1/unknown rid=018e4f2a-1234-7abc-9def-000000000002
+```
+
+## Automatic rid injection
+
+Inside the scope of `runWithRequestContext` (which wraps every non-preflight request in `routes.ts`), `log()` automatically appends `rid=<id>` to every line without any extra work from the caller:
+
+```typescript
+function formatMessage(level: LogLevel, message: string, ctx?: LogContext): string {
+  const rid = getCurrentRequestId();
+  // ...
+  const meta = formatContext({
+    ...(rid ? { rid } : {}),
+    ...ctx,
+  });
+  return `${color}${label}${LOG_RESET} ${sanitizeLogFragment(message)}${meta ? ` ${meta}` : ""}`;
+}
+```
+
+The request ID is resolved from `AsyncLocalStorage` — the same value that gets mirrored onto the response as `X-Request-ID`. This means every log line within a request's lifetime carries `rid=` automatically, correlating all log output for that request without passing the ID explicitly through your handler code.
+
+## Controlling verbosity with LOG_LEVEL
+
+Set the `LOG_LEVEL` environment variable to one of the five level names. Any log call below the configured level is a no-op — the message is never formatted or written.
+
+```bash
+LOG_LEVEL=debug bun run start   # show all messages
+LOG_LEVEL=warn  bun run start   # show warn, error, success only
+```
+
+The default is `info`, so `debug` messages are suppressed unless you explicitly lower the threshold.
+
+| `LOG_LEVEL` value | Suppresses |
+|-------------------|------------|
+| `debug` | nothing |
+| `info` (default) | `debug` |
+| `warn` | `debug`, `info` |
+| `error` | `debug`, `info`, `warn` |
+| `success` | `debug`, `info`, `warn`, `error` |
+
+<Warning>Setting `LOG_LEVEL=success` suppresses `error` logs. Use this level only when you have a separate error-reporting channel in place.</Warning>
+
+## Required usage in route handlers
+
+Every route module must call `log` at least once for meaningful outcomes (success, validation failure, unexpected error). The pipeline already writes the access log — route-level logs add context about what happened inside the handler.
+
+```typescript
+// after successful handling
+log("success", `GET ${path}`);
+
+// after a validation failure
+log("warn", `Invalid input on POST ${path}`, { field: "email" });
+
+// after an unexpected condition
+log("error", `Failed to read resource`, { id: resourceId });
+```

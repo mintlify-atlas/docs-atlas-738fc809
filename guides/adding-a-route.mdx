@@ -1,0 +1,204 @@
+---
+title: "Adding a route"
+description: "Step-by-step guide to creating a new API endpoint in bun-api-kit."
+---
+
+Every route in bun-api-kit follows the same structure: one folder per URL segment, one exported `handle` function, and the same four guards applied in the same order. This guide walks through each step using a `GET /api/v1/users` endpoint as a concrete example.
+
+<Steps>
+  <Step title="Create the route file">
+    Create a folder whose name matches the URL segment you want to expose after `/api/v1/`, then add a `.ts` file with the same name inside it.
+
+    ```
+    src/routes/users/users.ts
+    ```
+
+    The folder name becomes the URL segment. A folder named `users` maps to `/api/v1/users`.
+  </Step>
+
+  <Step title="Implement the handle function">
+    Export an async `handle` function with this exact signature:
+
+    ```typescript
+    export async function handle(
+      req: Request,
+      server: Bun.Server<undefined>,
+      pathname?: string,
+    ): Promise<Response | null>
+    ```
+
+    Return `null` if the request does not match this route (wrong path or method). The pipeline moves on to the next handler. Return a `Response` only when this route owns the request.
+
+    **Always check path and method first**, before running body size or rate limit checks — those should only run for requests this route actually handles.
+  </Step>
+
+  <Step title="Add body size enforcement">
+    Call `createRouteBodyLimit` once at module level (outside the handler, so the limit instance is created once and reused). Inside the handler, after the path/method check passes, `await checkBodySize` and return its response early if it is non-null.
+
+    ```typescript
+    import {
+      createRouteBodyLimit,
+      defaultMaxBodyBytes,
+    } from "../../utils/security/bodysize.ts";
+
+    const bodyLimit = createRouteBodyLimit({
+      maxBytes: defaultMaxBodyBytes(), // reads MAX_BODY_BYTES env, defaults to 1 MiB
+    });
+    ```
+
+    Use `defaultMaxBodyBytes()` to follow the global `MAX_BODY_BYTES` env var. Pass a literal number for routes that need a different ceiling (e.g. a file upload route).
+  </Step>
+
+  <Step title="Add rate limiting">
+    Call `createRouteLimiter` once at module level. Inside the handler, after body size passes, `await consumeOr429` and return its response early if non-null. Pick `points` and `durationSeconds` appropriate to your endpoint's expected traffic.
+
+    ```typescript
+    import { createRouteLimiter } from "../../utils/security/ratelimit.ts";
+
+    const rateLimit = createRouteLimiter({
+      points: 500,           // requests per window
+      durationSeconds: 60,   // window length in seconds
+      keyPrefix: "users",    // unique prefix for this route's limiter
+    });
+    ```
+
+    When the quota is exhausted `consumeOr429` returns an HTTP 429 response with a `Retry-After` header. Each route gets its own independent limiter instance.
+  </Step>
+
+  <Step title="Log meaningful events">
+    Every route module must call `log` at least once for relevant outcomes. Import it from `../../utils/logger.ts`.
+
+    ```typescript
+    import { log } from "../../utils/logger.ts";
+
+    // inside the handler:
+    log("success", `GET ${path}`, { count: users.length });
+    ```
+
+    Available levels: `debug`, `info`, `warn`, `error`, `success`. The logger automatically appends the current `rid` (request ID) to every line so you can trace a request across log entries.
+  </Step>
+
+  <Step title="Return responses with apiSuccess or apiFailure">
+    All route responses must go through `apiSuccess` or `apiFailure` from `../../utils/response.ts`. Do not use `Response.json` directly.
+
+    ```typescript
+    import { apiSuccess, apiFailure } from "../../utils/response.ts";
+
+    // 200 with a data payload:
+    return apiSuccess({ users });
+
+    // 400 with an error message:
+    return apiFailure({ message: "Invalid request." }, { status: 400 });
+    ```
+
+    Both helpers set `Content-Type: application/json; charset=utf-8` and wrap the payload in `{ success: true, data: ... }` or `{ success: false, data: ... }`. The `data` key is omitted when the payload is empty (`null`, `undefined`, `""`, `[]`, or `{}`).
+  </Step>
+
+  <Step title="Register the handler in routes.ts">
+    Import your handler in `src/routes/routes.ts` and add it to the `handlers` array. Order matters — the first handler that returns a non-null response wins.
+
+    ```typescript
+    import { handle as handleUsers } from "./users/users.ts";
+
+    const handlers = [handleHealth, handleHome, handleUsers] as const;
+    ```
+
+    You also need to add a bounded label for the new route in `getMetricRouteLabel` so metrics never record raw attacker-controlled paths.
+  </Step>
+</Steps>
+
+## Complete example
+
+Here is the full `src/routes/users/users.ts` file putting all seven steps together:
+
+```typescript
+import { PREFIX } from "../constants.ts";
+import {
+  createRouteBodyLimit,
+  defaultMaxBodyBytes,
+} from "../../utils/security/bodysize.ts";
+import { createRouteLimiter } from "../../utils/security/ratelimit.ts";
+import { log } from "../../utils/logger.ts";
+import { apiSuccess, apiFailure } from "../../utils/response.ts";
+import { z } from "zod";
+import { validateQuery, schemas } from "../../utils/validation.ts";
+
+/** Users is a read endpoint; follow the global body cap. */
+const bodyLimit = createRouteBodyLimit({
+  maxBytes: defaultMaxBodyBytes(),
+});
+
+/** Moderate read quota for a list endpoint. */
+const rateLimit = createRouteLimiter({
+  points: 500,
+  durationSeconds: 60,
+  keyPrefix: "users",
+});
+
+/** Handle `GET /api/v1/users` and return a paginated user list. */
+export async function handle(
+  req: Request,
+  server: Bun.Server<undefined>,
+  pathname?: string,
+): Promise<Response | null> {
+  const path = pathname ?? new URL(req.url).pathname;
+
+  // Step 1: gate on path and method before any expensive checks
+  if (path !== `${PREFIX}/users` || req.method !== "GET") {
+    return null;
+  }
+
+  // Step 2: enforce body size limit
+  const tooLarge = await bodyLimit.checkBodySize(req, path);
+  if (tooLarge) {
+    return tooLarge;
+  }
+
+  // Step 3: enforce rate limit
+  const limited = await rateLimit.consumeOr429(req, server);
+  if (limited) {
+    return limited;
+  }
+
+  // Step 4: validate query params
+  const url = new URL(req.url);
+  const rawQuery = Object.fromEntries(url.searchParams.entries());
+  const parsed = validateQuery(schemas.pagination, rawQuery);
+  if (!parsed.success) {
+    log("warn", `GET ${path} invalid query: ${parsed.error}`);
+    return apiFailure({ message: parsed.error }, { status: 400 });
+  }
+
+  const { page, limit } = parsed.data;
+
+  // Replace with your real data source:
+  const users = [
+    { id: "1", name: "Alice" },
+    { id: "2", name: "Bob" },
+  ];
+
+  log("success", `GET ${path}`, { page, limit, count: users.length });
+  return apiSuccess({ users, page, limit });
+}
+```
+
+### Registering in routes.ts
+
+```typescript
+// src/routes/routes.ts  (relevant lines)
+import { handle as handleUsers } from "./users/users.ts";
+
+const handlers = [handleHealth, handleHome, handleUsers] as const;
+```
+
+Also add a label for this route in `getMetricRouteLabel`:
+
+```typescript
+if (pathname === `${PREFIX}/users`) {
+  return "users";
+}
+```
+
+<Warning>
+  Do **not** add `respondNotFound` from `src/routes/error/error.ts` to the `handlers` array. It is only called by `routes.ts` after every handler in the array has returned `null`. Adding it to `handlers` would cause it to intercept all unmatched requests before the pipeline finishes.
+</Warning>

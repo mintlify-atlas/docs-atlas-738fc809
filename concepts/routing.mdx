@@ -1,0 +1,185 @@
+---
+title: "Routing"
+description: "How bun-api-kit matches incoming requests to route handlers using a file-based module pattern."
+---
+
+bun-api-kit uses a hand-written, first-match routing model. There is no framework magic — each route is a plain TypeScript module that exports a `handle` function, and `src/routes/routes.ts` walks a fixed array of those functions for every request.
+
+## URL structure
+
+All API endpoints share a common prefix defined in `src/routes/constants.ts`:
+
+```typescript
+export const PREFIX = "/api/v1";
+```
+
+A route named `home` lives at `GET /api/v1/home`. The folder name under `src/routes/` always matches the URL segment that follows the prefix.
+
+## File layout
+
+Each route lives in its own folder:
+
+```
+src/routes/
+├── constants.ts          # PREFIX and LOG_COLORS
+├── routes.ts             # pipeline + handlers array
+├── error/
+│   └── error.ts          # respondNotFound fallback
+├── health/
+│   └── health.ts         # GET /api/v1/health
+└── home/
+    └── home.ts           # GET /api/v1/home
+```
+
+The folder name equals the URL segment. The `.ts` file inside may have the same name as the folder or a different name — what matters is that it exports `handle`.
+
+## The handle function
+
+Every route module exports an async function with this exact signature:
+
+```typescript
+export async function handle(
+  req: Request,
+  server: Bun.Server<undefined>,
+  pathname?: string,
+): Promise<Response | null>
+```
+
+- Return **`null`** — this handler does not own the request (path or method mismatch). The pipeline moves to the next handler.
+- Return a **`Response`** — this handler owns the request. The pipeline stops and passes the response through `buildResponse` for finalization and compression.
+
+`pathname` is pre-parsed by `routes.ts` and passed in to avoid re-parsing the URL in every handler. When `pathname` is absent (e.g. in tests calling `handle` directly), the handler parses `req.url` itself.
+
+## Check order inside a handler
+
+Before doing any business logic, a handler must check in this order:
+
+<Steps>
+  <Step title="Path and method">
+    Return `null` immediately if the pathname or HTTP method does not match. This ensures the following guards never consume quota for the wrong route.
+
+    ```typescript
+    const path = pathname ?? new URL(req.url).pathname;
+    if (path !== `${PREFIX}/home` || req.method !== "GET") {
+      return null;
+    }
+    ```
+  </Step>
+
+  <Step title="Body size limit">
+    Check the request body against the route's configured limit. If the body is too large, return the 413 response immediately.
+
+    ```typescript
+    const tooLarge = await bodyLimit.checkBodySize(req, path);
+    if (tooLarge) {
+      return tooLarge;
+    }
+    ```
+  </Step>
+
+  <Step title="Rate limit">
+    Consume one point from the per-route limiter. If the client is over the limit, return the 429 response.
+
+    ```typescript
+    const limited = await rateLimit.consumeOr429(req, server);
+    if (limited) {
+      return limited;
+    }
+    ```
+  </Step>
+
+  <Step title="Business logic">
+    Handle the request and return a response using `apiSuccess` or `apiFailure`.
+
+    ```typescript
+    log("success", `GET ${path}`);
+    return apiSuccess();
+    ```
+  </Step>
+</Steps>
+
+## Complete example: the home route
+
+The following is the actual `src/routes/home/home.ts`:
+
+```typescript
+import { PREFIX } from "../constants.ts";
+import { createRouteBodyLimit, defaultMaxBodyBytes } from "../../utils/security/bodysize.ts";
+import { log } from "../../utils/logger.ts";
+import { createRouteLimiter } from "../../utils/security/ratelimit.ts";
+import { apiSuccess } from "../../utils/response.ts";
+
+/** Home is a lightweight read endpoint, so it uses the shared default body cap. */
+const bodyLimit = createRouteBodyLimit({
+  maxBytes: defaultMaxBodyBytes(),
+});
+
+/** Give the home endpoint a generous read-oriented quota. */
+const rateLimit = createRouteLimiter({
+  points: 5000,
+  durationSeconds: 60,
+  keyPrefix: "home",
+});
+
+/** Handle `GET /api/v1/home` and return a minimal success payload. */
+export async function handle(
+  req: Request,
+  server: Bun.Server<undefined>,
+  pathname?: string,
+): Promise<Response | null> {
+  const path = pathname ?? new URL(req.url).pathname;
+  if (path !== `${PREFIX}/home` || req.method !== "GET") {
+    return null;
+  }
+  const tooLarge = await bodyLimit.checkBodySize(req, path);
+  if (tooLarge) {
+    return tooLarge;
+  }
+  const limited = await rateLimit.consumeOr429(req, server);
+  if (limited) {
+    return limited;
+  }
+  log("success", `GET ${path}`);
+  return apiSuccess();
+}
+```
+
+`bodyLimit` and `rateLimit` are created once at module load time, giving each route its own independent in-memory counters.
+
+## Registering a handler
+
+Import the handler in `src/routes/routes.ts` and add it to the `handlers` array:
+
+```typescript
+import { handle as handleHome } from "./home/home.ts";
+import { handle as handleHealth } from "./health/health.ts";
+
+/** Route order is significant: the first handler that returns a response wins. */
+const handlers = [handleHealth, handleHome] as const;
+```
+
+<Warning>Order matters. The pipeline calls handlers in array order and stops at the first non-null return. Place more specific routes before broad ones.</Warning>
+
+## Not-found fallback
+
+When every handler returns `null`, the pipeline calls `respondNotFound` from `src/routes/error/error.ts`. This function applies its own body size check and rate limiter, then returns:
+
+```json
+{
+  "success": false,
+  "data": { "message": "The requested route does not exist." }
+}
+```
+
+with HTTP status `404`.
+
+<Note>`respondNotFound` is never added to the `handlers` array. It is a fallback called explicitly by `routes.ts` after the loop exhausts all handlers.</Note>
+
+## Adding a new route
+
+1. Create `src/routes/<routeName>/<routeName>.ts`.
+2. Export an async `handle(req, server, pathname?)` function.
+3. Follow the path/method → body limit → rate limit → response order.
+4. Import and add to the `handlers` array in `routes.ts`.
+5. Use `apiSuccess` / `apiFailure` for all responses.
+6. Call `log` at least once for meaningful outcomes.

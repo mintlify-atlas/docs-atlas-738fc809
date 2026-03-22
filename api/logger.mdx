@@ -1,0 +1,136 @@
+---
+title: "Logger"
+description: "Colorized, level-filtered plain-text logging with automatic request-scoped correlation IDs."
+---
+
+The logger writes single-line, colorized output to `stdout` or `stderr`. It automatically appends the current request ID (`rid=`) when called inside a request context, making it straightforward to correlate log lines with a specific request across the full pipeline.
+
+## Import
+
+```typescript
+import { log } from "../../utils/logger.ts";
+// adjust relative path based on your file location
+```
+
+A method-style convenience object is also exported:
+
+```typescript
+import { logger } from "../../utils/logger.ts";
+
+logger.info("server ready");
+logger.error("something failed", { code: 500 });
+```
+
+---
+
+## `log`
+
+```typescript
+export function log(level: LogLevel, message: string, ctx?: LogContext): void
+```
+
+<ParamField path="level" type="LogLevel" required>
+  One of `"debug"`, `"info"`, `"warn"`, `"error"`, `"success"`. Lines below the configured `LOG_LEVEL` are discarded before any formatting work is done.
+</ParamField>
+
+<ParamField path="message" type="string" required>
+  The main log message. Control characters (`\r`, `\n`, `\t`) and ANSI escape sequences are stripped so each line stays terminal-safe and single-line.
+</ParamField>
+
+<ParamField path="ctx" type="LogContext">
+  Optional free-form key/value metadata appended after the message.
+
+  <Expandable title="LogContext fields">
+    <ParamField path="rid" type="string">
+      Request correlation ID. You do not need to pass this manually — the logger reads the current request ID from `AsyncLocalStorage` automatically and prepends it.
+    </ParamField>
+    <ParamField path="traceId" type="string">
+      Distributed trace ID. Pass this explicitly from `getTraceHeaders()` when you want it in the log line.
+    </ParamField>
+    <ParamField path="[key: string]" type="unknown">
+      Any additional key/value pairs. Values are serialized with `String()`.
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+---
+
+## Log levels
+
+| Level | Numeric priority | ANSI color | Output stream |
+|-------|-----------------|------------|---------------|
+| `debug` | 0 | Gray (`\x1b[90m`) | `console.log` |
+| `info` | 1 | Cyan (`\x1b[36m`) | `console.log` |
+| `warn` | 2 | Yellow (`\x1b[33m`) | `console.warn` |
+| `error` | 3 | Red (`\x1b[31m`) | `console.error` |
+| `success` | 4 | Green (`\x1b[32m`) | `console.log` |
+
+Levels are compared numerically. Setting `LOG_LEVEL=warn` suppresses `debug` and `info` lines but keeps `warn`, `error`, and `success`.
+
+---
+
+## Output format
+
+```
+[LEVEL] message key1=value1 key2=value2
+```
+
+The label `[LEVEL]` is colorized using the constants from `src/routes/constants.ts`. The rest of the line is plain text. Each context field is serialized as `key=value` with no quoting.
+
+### Example lines
+
+```
+[INFO] GET /api/v1/home client=203.0.113.5 traceId=7f3a2b1c rid=550e8400-e29b-41d4-a716-446655440000
+[SUCCESS] Home handler reached rid=550e8400-e29b-41d4-a716-446655440000
+[WARN] Rate limit exceeded for key 203.0.113.5 rid=550e8400-e29b-41d4-a716-446655440000
+[ERROR] Unhandled error processing POST /api/v1/items: Cannot read properties of undefined traceId=7f3a2b1c rid=550e8400-e29b-41d4-a716-446655440000
+[DEBUG] Body size check passed bytes=312 limit=1048576 rid=550e8400-e29b-41d4-a716-446655440000
+```
+
+<Note>
+  `rid=` is appended automatically by the logger whenever `log()` is called inside a `runWithRequestContext` scope. You never need to pass it explicitly.
+</Note>
+
+---
+
+## `LOG_LEVEL` environment variable
+
+| Variable | Values | Default |
+|----------|--------|---------|
+| `LOG_LEVEL` | `debug` \| `info` \| `warn` \| `error` \| `success` | `info` |
+
+The minimum level is read once at startup from `Bun.env.LOG_LEVEL`. Lines below the threshold are dropped before formatting, so there is no CPU cost for suppressed levels.
+
+```bash
+# Show all levels including debug
+LOG_LEVEL=debug bun run start
+
+# Production — warn and above only
+LOG_LEVEL=warn bun run start
+```
+
+---
+
+## Usage in route handlers
+
+Every route module must call `log` for meaningful events. The access log for each incoming request is already written by `src/routes/routes.ts` at `info` level, so route files only need to log outcomes.
+
+```typescript
+import { log } from "../../utils/logger.ts";
+import { apiSuccess, apiFailure } from "../../utils/response.ts";
+
+export async function handle(req: Request, server: Bun.Server<undefined>): Promise<Response | null> {
+  if (req.method !== "GET" || new URL(req.url).pathname !== "/api/v1/home") {
+    return null;
+  }
+
+  // ... body limit check, rate limit check ...
+
+  log("success", "Home handler reached");
+  return apiSuccess();
+}
+```
+
+<Warning>
+  Do not use `console.log` directly in route handlers or server bootstrap code. Use `log` so output stays level-filtered, colorized, and correlated to the request ID.
+</Warning>

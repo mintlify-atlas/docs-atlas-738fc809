@@ -1,0 +1,105 @@
+---
+title: "Request correlation"
+description: "Track every request end-to-end using AsyncLocalStorage-scoped request IDs that flow through logs, response headers, and nested async calls."
+---
+
+Every request that enters `handleRequest` is wrapped in a correlation scope. The same ID is written to every log line produced during that request and echoed back to the caller on the response, so a single value ties together client-side traces, gateway logs, and server-side output.
+
+## How it works
+
+`runWithRequestContext` opens an `AsyncLocalStorage` scope for the duration of one request. Any code that runs inside that scope — including async continuations, nested `await` calls, and callbacks — can read the ID without it being threaded through function arguments.
+
+```typescript
+export function runWithRequestContext<T>(
+  req: Request,
+  fn: () => Promise<T>,
+): Promise<T>
+```
+
+Inside `routes.ts`, `runWithRequestContext` wraps `runWithTrace` so both the request ID and trace context are active for the entire handler chain:
+
+```typescript
+return runWithRequestContext(req, () =>
+  runWithTrace(async () => {
+    // request ID and trace ID are both in scope here
+  }),
+);
+```
+
+## ID resolution order
+
+`getRequestId` is called once per request inside `runWithRequestContext`. It checks incoming headers in priority order before falling back to a generated value:
+
+<Steps>
+  <Step title="X-Request-ID header">
+    If the `X-Request-ID` header is present and non-empty after trimming, its value is used (capped at 128 characters).
+  </Step>
+  <Step title="X-Correlation-ID header">
+    If `X-Request-ID` is absent, the `X-Correlation-ID` header is checked with the same rules.
+  </Step>
+  <Step title="Generated UUID">
+    If neither header is present, a `randomUUID()` is generated for this request.
+  </Step>
+</Steps>
+
+```typescript
+export function getRequestId(req: Request): string
+```
+
+<Note>
+  Header values are trimmed before use and silently truncated to 128 characters. This prevents overly long or whitespace-padded IDs from propagating into logs and response headers.
+</Note>
+
+## Reading the ID inside a request scope
+
+`getCurrentRequestId` returns the ID bound to the current async context. It returns `undefined` when called outside a `runWithRequestContext` scope (for example, in startup code or background tasks).
+
+```typescript
+export function getCurrentRequestId(): string | undefined
+```
+
+Example use inside a route handler:
+
+```typescript
+import { getCurrentRequestId } from "../../utils/requestid.ts";
+
+const id = getCurrentRequestId();
+if (id) {
+  // attach to an outgoing upstream request
+  upstreamHeaders.set("X-Request-ID", id);
+}
+```
+
+## Mirroring the ID onto the response
+
+`mirrorRequestIdHeader` reads the current request ID from the async context and sets it as the `X-Request-ID` header on the provided `Response`. It is a no-op if called outside a request scope.
+
+```typescript
+export function mirrorRequestIdHeader(response: Response): Response
+```
+
+In `routes.ts`, this is called inside `finalize`, which runs on every outgoing response:
+
+```typescript
+function finalize(response: Response): Response {
+  const traceId = getTraceId();
+  if (traceId) {
+    response.headers.set("X-Trace-ID", traceId);
+  }
+  return mergeSecurityHeaders(mirrorRequestIdHeader(response));
+}
+```
+
+Callers receive the same `X-Request-ID` value they supplied (or the generated UUID), making log correlation trivial on the client side.
+
+## Automatic log tagging
+
+The `log()` helper in `src/utils/logger.ts` calls `getCurrentRequestId()` on every invocation. When a request ID is in scope, it is appended automatically as a `rid=` field on the log line — no manual threading required.
+
+```typescript
+// Inside a route handler (within runWithRequestContext scope):
+log("success", "User created");
+// Output: [SUCCESS] User created rid=550e8400-e29b-41d4-a716-446655440000
+```
+
+The `rid` field appears on every log line emitted during the request, including access logs, route handler logs, error logs, and any utility code that calls `log()`.

@@ -1,0 +1,90 @@
+---
+title: "Security headers"
+description: "Baseline defense-in-depth HTTP response headers applied to every outbound API response."
+---
+
+`mergeSecurityHeaders` injects a fixed set of security-oriented response headers. It is called automatically via `finalize()` in `routes.ts` on every response that passes through the pipeline — successful handler responses, not-found responses, 413 body rejections, and 429 rate-limit responses.
+
+## Function
+
+### `mergeSecurityHeaders(response)`
+
+Adds baseline security headers to `response` **without overwriting headers that are already set**. This allows route handlers or middleware earlier in the pipeline to set their own values that take precedence.
+
+<ParamField path="response" type="Response" required>
+  The outgoing `Response` object to annotate. Headers are set directly on the existing `Headers` instance — no new `Response` is constructed.
+</ParamField>
+
+<ResponseField name="return" type="Response">
+  The same `Response` object passed in, with security headers now present.
+</ResponseField>
+
+<Note>
+  `mergeSecurityHeaders` mutates `response.headers` in place and returns the same object. It does **not** create a new `Response`.
+</Note>
+
+## Headers reference
+
+| Header | Value |
+|--------|-------|
+| `X-Content-Type-Options` | `nosniff` |
+| `X-Frame-Options` | `DENY` |
+| `Referrer-Policy` | `strict-origin-when-cross-origin` |
+| `Strict-Transport-Security` | `max-age=31536000; includeSubDomains` |
+| `Content-Security-Policy` | `default-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'` |
+| `X-XSS-Protection` | `0` |
+| `Permissions-Policy` | `accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()` |
+| `Cache-Control` | `no-store, no-cache, must-revalidate, private` |
+| `X-Download-Options` | `noopen` |
+| `X-Permitted-Cross-Domain-Policies` | `none` |
+
+### Header notes
+
+- **`Strict-Transport-Security`** — enforces HTTPS for one year (`max-age=31536000`) and applies to all subdomains.
+- **`Content-Security-Policy`** — denies all resource loads by default (`default-src 'none'`), restricts `<base>` and `<form>` actions to the same origin, and prevents the page from being embedded in any frame.
+- **`X-XSS-Protection: 0`** — explicitly disables the legacy XSS auditor. Modern browsers have removed it, and leaving it enabled can introduce vulnerabilities in older engines.
+- **`Permissions-Policy`** — disables camera, microphone, geolocation, payment, USB, and several sensor APIs that an API server should never access.
+- **`Cache-Control`** — prevents responses from being stored in any shared or private cache, protecting sensitive API data.
+- **`X-Permitted-Cross-Domain-Policies: none`** — blocks Adobe Flash and PDF readers from reading cross-domain responses.
+
+## Merge behavior
+
+The function iterates over the ten headers in order. For each one it calls `headers.has(key)` and only calls `headers.set(key, value)` when the header is absent. Headers that were set by the route handler, CORS middleware, or any earlier step in the pipeline are preserved unchanged.
+
+```typescript
+for (const [key, value] of SECURITY_HEADERS) {
+  if (!headers.has(key)) {
+    headers.set(key, value);
+  }
+}
+```
+
+## How it is applied in `routes.ts`
+
+`mergeSecurityHeaders` is called inside the private `finalize()` function in `src/routes/routes.ts`. `finalize` also sets `X-Trace-ID` and mirrors the request ID header, then every outbound response — including preflight 204s, 404s, 413s, and 429s — passes through it:
+
+```typescript
+// src/routes/routes.ts
+
+function finalize(response: Response): Response {
+  const traceId = getTraceId();
+  if (traceId) {
+    response.headers.set("X-Trace-ID", traceId);
+  }
+  return mergeSecurityHeaders(mirrorRequestIdHeader(response));
+}
+
+// CORS preflight early return
+const preflight = cors.handlePreflight(req);
+if (preflight) {
+  return finalize(preflight);
+}
+
+// Normal response path (inside buildResponse → finalize)
+let finalResponse = cors.appendCorsHeaders(response, req);
+finalResponse = finalize(finalResponse);
+```
+
+<Tip>
+  If a specific endpoint needs to override one of these values — for example setting a less restrictive `Content-Security-Policy` for a public documentation endpoint — set that header on the `Response` before it reaches `finalize`. The merge logic will detect it is already present and leave it alone.
+</Tip>
